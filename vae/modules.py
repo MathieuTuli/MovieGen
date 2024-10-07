@@ -396,9 +396,21 @@ class Model(nn.Module):
 
 
 class Encoder(nn.Module):
-    def __init__(self, *, ch, out_ch, ch_mult=(1, 2, 4, 8), num_res_blocks,
-                 attn_resolutions, dropout=0.0, resamp_with_conv=True, in_channels,
-                 resolution, z_channels, double_z=True, use_linear_attn=False, attn_type="vanilla",
+    def __init__(self,
+                 *,
+                 ch,
+                 out_ch,
+                 ch_mult=(1, 2, 4, 8),
+                 num_res_blocks,
+                 attn_resolutions,
+                 dropout=0.0,
+                 resamp_with_conv=True,
+                 in_channels,
+                 resolution,
+                 z_channels,
+                 double_z=True,
+                 use_linear_attn=False,
+                 attn_type="vanilla",
                  **ignore_kwargs):
         super().__init__()
         if use_linear_attn:
@@ -491,10 +503,23 @@ class Encoder(nn.Module):
 
 
 class Decoder(nn.Module):
-    def __init__(self, *, ch, out_ch, ch_mult=(1, 2, 4, 8), num_res_blocks,
-                 attn_resolutions, dropout=0.0, resamp_with_conv=True, in_channels,
-                 resolution, z_channels, give_pre_end=False, tanh_out=False, use_linear_attn=False,
-                 attn_type="vanilla", **ignorekwargs):
+    def __init__(self,
+                 *,
+                 ch,
+                 out_ch,
+                 ch_mult=(1, 2, 4, 8),
+                 num_res_blocks,
+                 attn_resolutions,
+                 dropout=0.0,
+                 resamp_with_conv=True,
+                 in_channels,
+                 resolution,
+                 z_channels,
+                 give_pre_end=False,
+                 tanh_out=False,
+                 use_linear_attn=False,
+                 attn_type="vanilla",
+                 **ignorekwargs):
         super().__init__()
         if use_linear_attn:
             attn_type = "linear"

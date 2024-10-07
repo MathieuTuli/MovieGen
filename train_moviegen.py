@@ -6,8 +6,8 @@ References:
 """
 from collections import OrderedDict
 from dataclasses import dataclass
+from typing import Tuple, List
 from pathlib import Path
-from typing import Tuple
 
 import argparse
 import inspect
@@ -297,6 +297,15 @@ class TextEncoder(nn.Module):
             ("ln", nn.LayerNorm(config.embed_dim)),
         ]))
 
+    def from_pretrained(self, ul2_ckpt: Path, byt5_ckpt: Path,
+                        metaclip_ckpt: Path, tae_ckpt: Path):
+        self.ul2.encoder.load_state_dict(
+            torch.load(ul2_ckpt, map_location="cpu", weights_only=True))
+        self.byt5.encoder.load_state_dict(
+            torch.load(byt5_ckpt, map_location="cpu", weights_only=True))
+        self.metaclip_ckpt.encoder.load_state_dict(
+            torch.load(metaclip_ckpt, map_location="cpu", weights_only=True))
+
     def forward(self, x) -> torch.Tensor:
         ul2_emb = self.ul2(x)
         byt5_emb = self.byt5(x)
@@ -307,8 +316,17 @@ class TextEncoder(nn.Module):
 @dataclass
 class TAEConfig:
     version: str = "1.0"
-    embed_dim: int = 64
-    z_channels: int = 2
+    embed_dim: int = 3
+    z_channels: int = 3
+    double_z: bool = True
+    resolution: int = 256
+    in_channels: int = 3
+    out_ch: int = 3
+    ch: int = 128
+    ch_mult: List[int] = [1, 2, 4]  # num_down = len(ch_mult)-1
+    num_res_blocks: int = 2
+    attn_resolutions: List[int] = []
+    dropout: float = 0.0
 
     def __init__(self, **kwargs):
         for k, v in kwargs.items():
@@ -320,9 +338,27 @@ class TAE(nn.Module):
     def __init__(self, config: TAEConfig):
         super().__init__()
         self.config = config
-        self.loss = None
-        self.encoder = Encoder(config)
-        self.decoder = Decoder(config)
+        self.encoder = Encoder(
+                ch=config.ch,
+                out_ch=config.out_ch,
+                ch_mult=config.ch_mult,
+                num_res_blocks=config.num_res_blocks,
+                dropout=config.dropout,
+                in_channels=config.in_channels,
+                resolution=config.resolution,
+                z_channels=config.z_channels,
+                double_z=config.double_z,)
+        self.decoder = Decoder(
+                ch=config.ch,
+                out_ch=config.out_ch,
+                ch_mult=config.ch_mult,
+                num_res_blocks=config.num_res_blocks,
+                attn_resolutions=config.attn_resolutions,
+                dropout=config.dropout,
+                in_channels=config.in_channels,
+                resolution=config.resolution,
+                z_channels=config.z_channels,
+                double_z=config.double_z,)
 
         self.quant_conv = torch.nn.Conv2d(
             2 * config.z_channels, 2 * config.embed_dim, 1)
@@ -332,16 +368,18 @@ class TAE(nn.Module):
 
         # REVISIT: self.init_from_ckpt(ckpt_path, ignore_keys=ignore_keys)
 
-    def init_from_ckpt(self, path, ignore_keys=list()):
-        sd = torch.load(path, map_location="cpu")["state_dict"]
+    def loss(self, *args, **kwargs):
+        raise NotImplementedError("VAE training not supported")
+
+    def from_pretrained(self, ckpt: Path, ignore_keys=list()):
+        sd = torch.load(ckpt, map_location="cpu")["state_dict"]
         keys = list(sd.keys())
         for k in keys:
             for ik in ignore_keys:
                 if k.startswith(ik):
-                    print("Deleting key {} from state_dict.".format(k))
+                    print("TAE: Deleting key {} from state_dict.".format(k))
                     del sd[k]
-        self.load_state_dict(sd, strict=False)
-        print(f"Restored from {path}")
+        self.load_state_dict(sd, strict=False if ignore_keys else True)
 
     def encode(self, x):
         h = self.encoder(x)
@@ -430,37 +468,11 @@ class TAE(nn.Module):
     def get_last_layer(self):
         return self.decoder.conv_out.weight
 
-    @torch.no_grad()
-    def log_images(self, batch, only_inputs=False, **kwargs):
-        log = dict()
-        x = self.get_input(batch, self.image_key)
-        x = x.to(self.device)
-        if not only_inputs:
-            xrec, posterior = self(x)
-            if x.shape[1] > 3:
-                # colorize with random projection
-                assert xrec.shape[1] > 3
-                x = self.to_rgb(x)
-                xrec = self.to_rgb(xrec)
-            log["samples"] = self.decode(torch.randn_like(posterior.sample()))
-            log["reconstructions"] = xrec
-        log["inputs"] = x
-        return log
-
-    def to_rgb(self, x):
-        assert self.image_key == "segmentation"
-        if not hasattr(self, "colorize"):
-            self.register_buffer(
-                "colorize", torch.randn(3, x.shape[1], 1, 1).to(x))
-        x = F.conv2d(x, weight=self.colorize)
-        x = 2.*(x-x.min())/(x.max()-x.min()) - 1.
-        return x
-
 
 @dataclass
 class MovieGenConfig:
     version: str = "1.0"
-    dim: int = 64
+    dim: int = 3
     pk: Tuple[int, int, int] = (1, 2, 2)
     # Layers Model Dimension FFN Dimension Attention Heads Activation Function Normalization
     # 48 6144 16384 48 SwiGLU RMSNorm
@@ -472,7 +484,9 @@ class MovieGenConfig:
 
 
 class MovieGen(nn.Module):
-    def __init__(self, config: MovieGenConfig):
+    def __init__(self,
+                 config: MovieGenConfig,
+                 ):
         super().__init__()
         self.config = config
 
@@ -492,6 +506,35 @@ class MovieGen(nn.Module):
         # init all weights, use a torch rng object to be very careful
         self.init_rng = torch.Generator()
         self.init_rng.manual_seed(420)
+
+    @classmethod
+    def initialize_auxiliary_models(self,
+                                    ul2_ckpt: Path, byt5_ckpt: Path,
+                                    metaclip_ckpt: Path, tae_ckpt: Path):
+        self.text_encoder.from_pretrained(ul2_ckpt, byt5_ckpt, metaclip_ckpt)
+        self.tae.from_pretrained(tae_ckpt)
+
+    @classmethod
+    def from_pretrained(self,
+                        ckpt: Path, ul2_ckpt: Path, byt5_ckpt: Path,
+                        metaclip_ckpt: Path, tae_ckpt: Path):
+        model_args = MovieGenConfig()
+
+        checkpoint = torch.load(ckpt, map_location="cpu", weights_only=True)
+
+        # save the default type
+        original_default_type = torch.get_default_dtype()
+        # much faster loading
+        torch.set_default_tensor_type(torch.cuda.BFloat16Tensor)
+        model = MovieGen(model_args)
+        model.load_state_dict(checkpoint, strict=False)
+        # restore type
+        torch.set_default_tensor_type(torch.tensor(
+            [], dtype=original_default_type, device="cpu").type())
+
+        self.initialize_auxiliary_models(
+                ul2_ckpt, byt5_ckpt, metaclip_ckpt, tae_ckpt)
+        return model
 
     def loss(self,):
         ...
@@ -529,8 +572,11 @@ class MovieGen(nn.Module):
             optim_groups, lr=lr, betas=betas, fused=use_fused)
         return optimizer
 
-    def forward(self, idx, targets=None, return_logits=True, start_pos=0):
-        _, t = idx.size()
+    def forward(self, x, prompt, targets=None, return_logits=True, start_pos=0):
+        _, t = x.size()
+        prompt_embedding = self.text_encoder(prompt)
+        x = self.tae.encode(x)
+        x = self.tae.decode(x)
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
@@ -581,8 +627,12 @@ args
 parser = argparse.ArgumentParser()
 # io
 # yes you can use parser types like this
-parser.add_argument("--ckpt-dir", type=mkpath, default="./tmp/ckpt")
+parser.add_argument("--ckpt", type=asspath, required=False)
 parser.add_argument("--output-dir", type=mkpath, default="")
+parser.add_argument("--ul2-ckpt", type=asspath, required=False)
+parser.add_argument("--byt5-ckpt", type=asspath, required=False)
+parser.add_argument("--metaclip-ckpt", type=asspath, required=False)
+parser.add_argument("--tae-ckpt", type=asspath, required=False)
 # optimization
 parser.add_argument("--lr", type=float, default=1e-5)
 parser.add_argument("--weight-decay", type=float, default=0.0)
