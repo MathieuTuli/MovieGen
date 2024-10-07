@@ -15,9 +15,11 @@ import time
 import math
 import os
 
-from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn import functional as F
+from einops import rearrange
+from torch import einsum
 
 import torch.distributed as dist
 import torch.nn as nn
@@ -142,7 +144,12 @@ class RMSNorm(torch.nn.Module):
         return output * self.weight
 
 
-class CausalSelfAttention(nn.Module):
+class BidirectionalSelfAttention(nn.Module):
+    """
+    source: https://github.com/karpathy/llm.c
+        - Copy of the Causal attention without the masking basically
+    """
+
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
@@ -172,6 +179,7 @@ class CausalSelfAttention(nn.Module):
                 config.n_kv_head, self.hd))
 
     def forward(self, x, freqs_cis=None, start_pos=None, mask=None):
+        assert mask is None
         # batch size, sequence length, embedding dimensionality (n_embd)
         B, T, C = x.size()
         # calculate query, key, values for all heads in batch
@@ -208,7 +216,7 @@ class CausalSelfAttention(nn.Module):
                 q, k, v, mask == 0 if T > 1 else None)
         else:
             # manual implementation of attention
-            # this materializes the large (T,T) matrix for all queries and keys
+            # this materializes the large (T, T) matrix for all queries and keys
             scores = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.hd))
             if mask is not None:
                 scores.masked_fill_(mask, torch.finfo(scores.dtype).min)
@@ -219,19 +227,139 @@ class CausalSelfAttention(nn.Module):
         return y
 
 
+class BidirectionalCrossAttention(nn.Module):
+    """
+    # NOQA source: https://github.com/lucidrains/bidirectional-cross-attention/tree/main
+    """
+
+    def __init__(
+        self,
+        *,
+        dim,
+        heads=8,
+        dim_head=64,
+        context_dim=None,
+        dropout=0.,
+        talking_heads=False,
+        prenorm=False
+    ):
+        super().__init__()
+        context_dim = context_dim or dim
+
+        self.norm = nn.LayerNorm(dim) if prenorm else nn.Identity()
+        self.context_norm = nn.LayerNorm(
+            context_dim) if prenorm else nn.Identity()
+
+        self.heads = heads
+        self.scale = dim_head ** -0.5
+        inner_dim = dim_head * heads
+
+        self.dropout = nn.Dropout(dropout)
+        self.context_dropout = nn.Dropout(dropout)
+
+        self.to_qk = nn.Linear(dim, inner_dim, bias=False)
+        self.context_to_qk = nn.Linear(context_dim, inner_dim, bias=False)
+
+        self.to_v = nn.Linear(dim, inner_dim, bias=False)
+        self.context_to_v = nn.Linear(context_dim, inner_dim, bias=False)
+
+        self.to_out = nn.Linear(inner_dim, dim)
+        self.context_to_out = nn.Linear(inner_dim, context_dim)
+
+        self.talking_heads = nn.Conv2d(
+            heads, heads, 1, bias=False) if talking_heads else nn.Identity()
+        self.context_talking_heads = nn.Conv2d(
+            heads, heads, 1, bias=False) if talking_heads else nn.Identity()
+
+    def forward(
+            self,
+            x,
+            context,
+            mask=None,
+            context_mask=None,
+            return_attn=False,
+            rel_pos_bias=None):
+        b, i, j, h, device = \
+            x.shape[0], x.shape[-2], context.shape[-2], self.heads, x.device
+
+        x = self.norm(x)
+        context = self.context_norm(context)
+
+        # get shared query/keys and values for sequence and context
+
+        qk, v = self.to_qk(x), self.to_v(x)
+        context_qk, context_v = self.context_to_qk(
+            context), self.context_to_v(context)
+
+        # split out head
+
+        qk, context_qk, v, context_v = map(lambda t: rearrange(
+            t, 'b n (h d) -> b h n d', h=h), (qk, context_qk, v, context_v))
+
+        # get similarities
+
+        sim = einsum('b h i d, b h j d -> b h i j',
+                     qk, context_qk) * self.scale
+
+        # relative positional bias, if supplied
+
+        if rel_pos_bias is not None:
+            sim = sim + rel_pos_bias
+
+        # mask
+
+        if mask is not None or context_mask is not None:
+            mask = mask or torch.ones(
+                (b, i), device=device, dtype=torch.bool)
+            context_mask = context_mask or torch.ones(
+                (b, j), device=device, dtype=torch.bool)
+
+            attn_mask = rearrange(mask, 'b i -> b 1 i 1') * \
+                rearrange(context_mask, 'b j -> b 1 1 j')
+            sim = sim.masked_fill(~attn_mask, -torch.finfo(sim.dtype).max)
+
+        # get attention along both sequence len and context len dimensions
+        # shared similarity matrix
+
+        attn = sim.softmax(dim=-1)
+        context_attn = sim.softmax(dim=-2)
+
+        # dropouts
+
+        attn = self.dropout(attn)
+        context_attn = self.context_dropout(context_attn)
+
+        # talking heads
+
+        attn = self.talking_heads(attn)
+        context_attn = self.context_talking_heads(context_attn)
+
+        # src sequence aggregates values from context,
+        # context aggregates values from src sequence
+
+        out = einsum('b h i j, b h j d -> b h i d', attn, context_v)
+        context_out = einsum('b h j i, b h j d -> b h i d', context_attn, v)
+
+        # merge heads and combine out
+
+        out, context_out = map(lambda t: rearrange(
+            t, 'b h n d -> b n (h d)'), (out, context_out))
+
+        out = self.to_out(out)
+        context_out = self.context_to_out(context_out)
+
+        if return_attn:
+            return out, context_out, attn, context_attn
+
+        return out, context_out
+
+
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        hidden_dim = 4 * config.n_embd
-        hidden_dim = int(2 * hidden_dim / 3)
-        # custom dim factor multiplier
-        if config.ffn_dim_multiplier is not None:
-            hidden_dim = int(config.ffn_dim_multiplier * hidden_dim)
-        hidden_dim = config.multiple_of * \
-            ((hidden_dim + config.multiple_of - 1) // config.multiple_of)
-        self.c_fc = nn.Linear(config.n_embd, hidden_dim, bias=False)
-        self.c_fc2 = nn.Linear(config.n_embd, hidden_dim, bias=False)
-        self.c_proj = nn.Linear(hidden_dim, config.n_embd, bias=False)
+        self.c_fc = nn.Linear(config.n_embd, config.ffn_dim, bias=False)
+        self.c_fc2 = nn.Linear(config.n_embd, config.ffn_dim, bias=False)
+        self.c_proj = nn.Linear(config.ffn_dim, config.n_embd, bias=False)
 
     def forward(self, x):
         # REVISIT: SwiGLU self.c_proj(F.silu(self.c_fc2(x)) * self.c_fc(x))  <-- 3.
@@ -247,12 +375,17 @@ class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.ln_1 = RMSNorm(config.n_embd, config.norm_eps)
-        self.attn = CausalSelfAttention(config)
+        self.attn = BidirectionalSelfAttention(config)
         self.ln_2 = RMSNorm(config.n_embd, config.norm_eps)
+        # TODO: Add cross attention here for prompt embd
+        self.bd_cross_attn = BidirectionalCrossAttention(
+                dim=config.n_embd, heads=config.n_head,
+                dim_head=config.dim_head)
         self.mlp = MLP(config)
 
-    def forward(self, x, freqs_cis=None, start_pos=None, mask=None):
+    def forward(self, x, ctx, freqs_cis=None, start_pos=None, mask=None):
         x = x + self.attn(self.ln_1(x), freqs_cis, start_pos, mask)
+        x = self.bd_cross_attn(x, ctx)
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -283,17 +416,17 @@ class TextEncoder(nn.Module):
         # TODO: copy models
         self.ul2 = nn.Sequential(OrderedDict([
             ("encoder", ...),
-            ("proj", nn.Linear(768, config.embed_dim, bias=False)),
+            ("proj", nn.Linear(4096, config.embed_dim, bias=False)),
             ("ln", nn.LayerNorm(config.embed_dim)),
         ]))
         self.byt5 = nn.Sequential(OrderedDict([
             ("encoder", ...),
-            ("proj", nn.Linear(768, config.embed_dim, bias=False)),
+            ("proj", nn.Linear(1280, config.embed_dim, bias=False)),
             ("ln", nn.LayerNorm(config.embed_dim)),
         ]))
         self.metaclip = nn.Sequential(OrderedDict([
             ("encoder", ...),
-            ("proj", nn.Linear(768, config.embed_dim, bias=False)),
+            ("proj", nn.Linear(1472, config.embed_dim, bias=False)),
             ("ln", nn.LayerNorm(config.embed_dim)),
         ]))
 
@@ -339,26 +472,26 @@ class TAE(nn.Module):
         super().__init__()
         self.config = config
         self.encoder = Encoder(
-                ch=config.ch,
-                out_ch=config.out_ch,
-                ch_mult=config.ch_mult,
-                num_res_blocks=config.num_res_blocks,
-                dropout=config.dropout,
-                in_channels=config.in_channels,
-                resolution=config.resolution,
-                z_channels=config.z_channels,
-                double_z=config.double_z,)
+            ch=config.ch,
+            out_ch=config.out_ch,
+            ch_mult=config.ch_mult,
+            num_res_blocks=config.num_res_blocks,
+            dropout=config.dropout,
+            in_channels=config.in_channels,
+            resolution=config.resolution,
+            z_channels=config.z_channels,
+            double_z=config.double_z,)
         self.decoder = Decoder(
-                ch=config.ch,
-                out_ch=config.out_ch,
-                ch_mult=config.ch_mult,
-                num_res_blocks=config.num_res_blocks,
-                attn_resolutions=config.attn_resolutions,
-                dropout=config.dropout,
-                in_channels=config.in_channels,
-                resolution=config.resolution,
-                z_channels=config.z_channels,
-                double_z=config.double_z,)
+            ch=config.ch,
+            out_ch=config.out_ch,
+            ch_mult=config.ch_mult,
+            num_res_blocks=config.num_res_blocks,
+            attn_resolutions=config.attn_resolutions,
+            dropout=config.dropout,
+            in_channels=config.in_channels,
+            resolution=config.resolution,
+            z_channels=config.z_channels,
+            double_z=config.double_z,)
 
         self.quant_conv = torch.nn.Conv2d(
             2 * config.z_channels, 2 * config.embed_dim, 1)
@@ -416,9 +549,9 @@ class TAE(nn.Module):
         if optimizer_idx == 0:
             # train encoder+decoder+logvar
             aeloss, log_dict_ae = self.loss(
-                    inputs, reconstructions, posterior, optimizer_idx,
-                    self.global_step, last_layer=self.get_last_layer(),
-                    split="train")
+                inputs, reconstructions, posterior, optimizer_idx,
+                self.global_step, last_layer=self.get_last_layer(),
+                split="train")
             self.log("aeloss", aeloss, prog_bar=True,
                      logger=True, on_step=True, on_epoch=True)
             self.log_dict(log_dict_ae, prog_bar=False,
@@ -428,9 +561,9 @@ class TAE(nn.Module):
         if optimizer_idx == 1:
             # train the discriminator
             discloss, log_dict_disc = self.loss(
-                    inputs, reconstructions, posterior, optimizer_idx,
-                    self.global_step, last_layer=self.get_last_layer(),
-                    split="train")
+                inputs, reconstructions, posterior, optimizer_idx,
+                self.global_step, last_layer=self.get_last_layer(),
+                split="train")
 
             self.log("discloss", discloss, prog_bar=True,
                      logger=True, on_step=True, on_epoch=True)
@@ -442,12 +575,12 @@ class TAE(nn.Module):
         inputs = self.get_input(batch, self.image_key)
         reconstructions, posterior = self(inputs)
         aeloss, log_dict_ae = self.loss(
-                inputs, reconstructions, posterior, 0, self.global_step,
-                last_layer=self.get_last_layer(), split="val")
+            inputs, reconstructions, posterior, 0, self.global_step,
+            last_layer=self.get_last_layer(), split="val")
 
         discloss, log_dict_disc = self.loss(
-                inputs, reconstructions, posterior, 1, self.global_step,
-                last_layer=self.get_last_layer(), split="val")
+            inputs, reconstructions, posterior, 1, self.global_step,
+            last_layer=self.get_last_layer(), split="val")
 
         self.log("val/rec_loss", log_dict_ae["val/rec_loss"])
         self.log_dict(log_dict_ae)
@@ -472,10 +605,22 @@ class TAE(nn.Module):
 @dataclass
 class MovieGenConfig:
     version: str = "1.0"
-    dim: int = 3
-    pk: Tuple[int, int, int] = (1, 2, 2)
-    # Layers Model Dimension FFN Dimension Attention Heads Activation Function Normalization
-    # 48 6144 16384 48 SwiGLU RMSNorm
+    block_size: int = 8192
+    in_channels: int = 64
+    vocab_size: int = ...
+    n_layer: int = 48
+    n_head: int = 48
+    dim_head: int = 128  # REVISIT: or 96?
+    n_embd: int = 6144
+    ffn_dim: int = 16384  # 6144 * 4 * 2/3
+    multiple_of: int = 1024
+    norm_eps: float = 1e-5
+    rope_theta: float = 500000.0
+    use_scaled_rope: bool = True
+    max_gen_batch_size: int = 4
+    use_kv: bool = True
+    flash: bool = False  # use flashattention?
+    patch_k: Tuple[int, int, int] = (1, 2, 2)
 
     def __init__(self, **kwargs):
         for k, v in kwargs.items():
@@ -494,11 +639,12 @@ class MovieGen(nn.Module):
         self.text_encoder = TextEncoder(TextEncoderConfig())
         self.tae = TAE(TAEConfig())
 
-        self.patchifier = nn.Conv3d(in_channels=config.dim,
-                                    out_channels=config.dim,
-                                    kernel_size=config.pk, stride=config.pk)
+        self.patchifier = nn.Conv3d(in_channels=config.in_channels,
+                                    out_channels=config.n_embd,
+                                    kernel_size=config.patch_k,
+                                    stride=config.patch_k)
         self.transformer = nn.ModuleDict(dict(
-            wte=nn.Embedding(config.vocab_size, config.n_embd),
+            # REVISIT: wte=nn.Embedding(config.vocab_size, config.n_embd),
             h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f=RMSNorm(config.n_embd, config.norm_eps),
         ))
@@ -533,7 +679,7 @@ class MovieGen(nn.Module):
             [], dtype=original_default_type, device="cpu").type())
 
         self.initialize_auxiliary_models(
-                ul2_ckpt, byt5_ckpt, metaclip_ckpt, tae_ckpt)
+            ul2_ckpt, byt5_ckpt, metaclip_ckpt, tae_ckpt)
         return model
 
     def loss(self,):
@@ -574,17 +720,25 @@ class MovieGen(nn.Module):
 
     def forward(self, x, prompt, targets=None, return_logits=True, start_pos=0):
         _, t = x.size()
-        prompt_embedding = self.text_encoder(prompt)
+        ctx = self.text_encoder(prompt)
         x = self.tae.encode(x)
+        x = self.patchifier(x).flatten()
+
+        for i, block in enumerate(self.transformer.h):
+            x = block(x, ctx)
+        x = self.transformer.ln_f(x)
+
         x = self.tae.decode(x)
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x).float()
             loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+                logits.view(
+                    -1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
-            # inference-time mini-optimization: only forward the lm_head on the very last position
+            # inference-time mini-optimization: only forward the lm_head
+            # on the very last position
             # note: using list [-1] to preserve the time dim
             logits = self.lm_head(x[:, [-1], :]).float()
             loss = None
