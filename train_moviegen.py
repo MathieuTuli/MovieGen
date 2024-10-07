@@ -29,6 +29,16 @@ import torch
 from .vae.distributions import DiagonalGaussianDistribution
 from .vae.modules import Encoder, Decoder
 
+# NOQA TODO: dim issues for sure, need to test: particularly the cross attention I just plopped in there
+# NOQA TODO: conv3d patchifier also is naively wrote in from first paper reading: needs review
+# NOQA TODO: need to add the rest of the TAE augs for time inflation and weight loading
+# NOQA TODO: review all REVISIT tags
+# NOQA TODO: dataloader also empty, fill that
+# NOQA TODO: DDP is copied naively from llm.c - confirm
+# NOQA TODO: shard text/vae probably (other parallels from paper maybe?)
+# NOQA TODO: refactor to enable pre-train tae
+#               - or keep in same file? idk
+
 """
 -------------------------------------------------------------------------------
 helpers
