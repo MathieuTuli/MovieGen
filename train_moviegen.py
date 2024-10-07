@@ -110,6 +110,45 @@ def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
     return freqs_cis.view(*shape)
 
 
+def apply_scaling(freqs: torch.Tensor):
+    # Values obtained from grid search
+    scale_factor = 8
+    low_freq_factor = 1
+    high_freq_factor = 4
+    old_context_len = 6144  # original moviegen length
+
+    low_freq_wavelen = old_context_len / low_freq_factor
+    high_freq_wavelen = old_context_len / high_freq_factor
+    new_freqs = []
+    for freq in freqs:
+        wavelen = 2 * math.pi / freq
+        if wavelen < high_freq_wavelen:
+            new_freqs.append(freq)
+        elif wavelen > low_freq_wavelen:
+            new_freqs.append(freq / scale_factor)
+        else:
+            assert low_freq_wavelen != high_freq_wavelen
+            smooth = (old_context_len / wavelen - low_freq_factor) / (
+                high_freq_factor - low_freq_factor
+            )
+            new_freqs.append((1 - smooth) * freq /
+                             scale_factor + smooth * freq)
+    return torch.tensor(new_freqs, dtype=freqs.dtype, device=freqs.device)
+
+
+def precompute_freqs_cis(
+    dim: int, end: int, theta: float = 10000.0, use_scaled: bool = False
+):
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)
+                   [: (dim // 2)].float() / dim))
+    t = torch.arange(end, device=freqs.device, dtype=torch.float32)
+    if use_scaled:
+        freqs = apply_scaling(freqs)
+    freqs = torch.outer(t, freqs)
+    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
+    return freqs_cis
+
+
 def apply_rotary_emb(
     xq: torch.Tensor,
     xk: torch.Tensor,
@@ -653,6 +692,12 @@ class MovieGen(nn.Module):
         self.init_rng = torch.Generator()
         self.init_rng.manual_seed(420)
 
+        self.freqs_cis = precompute_freqs_cis(
+            config.n_embd // config.n_head,
+            config.block_size * 2,
+            config.rope_theta,
+            config.use_scaled_rope,)
+
     @classmethod
     def initialize_auxiliary_models(self,
                                     ul2_ckpt: Path, byt5_ckpt: Path,
@@ -718,14 +763,16 @@ class MovieGen(nn.Module):
             optim_groups, lr=lr, betas=betas, fused=use_fused)
         return optimizer
 
-    def forward(self, x, prompt, targets=None, return_logits=True, start_pos=0):
-        _, t = x.size()
+    def forward(self, x, prompt,
+                targets=None, return_logits=True, start_pos=0):
+        _, t = x.size()  # REVISIT: from llama3, needs to be updated
         ctx = self.text_encoder(prompt)
         x = self.tae.encode(x)
         x = self.patchifier(x).flatten()
 
+        freqs_cis = self.freqs_cis[start_pos:start_pos+t]
         for i, block in enumerate(self.transformer.h):
-            x = block(x, ctx)
+            x = block(x, ctx, freqs_cis, start_pos)
         x = self.transformer.ln_f(x)
 
         x = self.tae.decode(x)
