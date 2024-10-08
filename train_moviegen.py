@@ -494,20 +494,19 @@ class TextEncoder(nn.Module):
         ul2_emb = self.metaclip(x)
         return torch.cat((ul2_emb, byt5_emb, ul2_emb))
 
-
 @dataclass
 class TAEConfig:
     version: str = "1.0"
     embed_dim: int = 3
-    z_channels: int = 3
-    double_z: bool = True
+    z_channels: int = 16
+    double_z: bool = False  # Different from original work of False
     resolution: int = 256
     in_channels: int = 3
     out_ch: int = 3
     ch: int = 128
-    ch_mult: List[int] = [1, 2, 4]  # num_down = len(ch_mult)-1
+    ch_mult: List[int] = [1, 1, 2, 2, 4]  # num_down = len(ch_mult)-1
     num_res_blocks: int = 2
-    attn_resolutions: List[int] = []
+    attn_resolutions: List[int] = [16]
     dropout: float = 0.0
 
     def __init__(self, **kwargs):
@@ -555,13 +554,7 @@ class TAE(nn.Module):
 
     def from_pretrained(self, ckpt: Path, ignore_keys=list()):
         sd = torch.load(ckpt, map_location="cpu")["state_dict"]
-        keys = list(sd.keys())
-        for k in keys:
-            for ik in ignore_keys:
-                if k.startswith(ik):
-                    print("TAE: Deleting key {} from state_dict.".format(k))
-                    del sd[k]
-        self.load_state_dict(sd, strict=False if ignore_keys else True)
+        self.load_state_dict(sd, strict=True)
 
     def encode(self, x):
         h = self.encoder(x)
