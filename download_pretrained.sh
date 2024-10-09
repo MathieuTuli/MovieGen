@@ -12,19 +12,19 @@ unzip kl-f16.zip
 cd ../..
 
 # ul2
-cd pretrained-weights/tae
-wget ???
-unzip ???.zip
-cd ../..
+#- cd pretrained-weights/tae
+#- wget ???
+#- unzip ???.zip
+#- cd ../..
 
 # byt5
-cd pretrained-weights/tae
-wget ???
-unzip ???.zip
-cd ../..
+#- cd pretrained-weights/tae
+#- wget ???
+#- unzip ???.zip
+#- cd ../..
 
 # metaclip
-cd pretrained-weights/tae
-wget ???
-unzip ???.zip
-cd ../..
+#- cd pretrained-weights/tae
+#- wget ???
+#- unzip ???.zip
+#- cd ../..

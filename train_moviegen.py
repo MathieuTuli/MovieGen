@@ -6,7 +6,7 @@ References:
 """
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Tuple, List
+from typing import Tuple
 from pathlib import Path
 
 import argparse
@@ -26,12 +26,12 @@ import torch.nn as nn
 import numpy as np
 import torch
 
-from .vae.distributions import DiagonalGaussianDistribution
-from .vae.modules import Encoder, Decoder
+from vae.distributions import DiagonalGaussianDistribution
+from vae.modules import TemporalEncoder, TemporalDecoder
 
 # NOQA TODO: dim issues for sure, need to test: particularly the cross attention I just plopped in there
 # NOQA TODO: conv3d patchifier also is naively wrote in from first paper reading: needs review
-# NOQA TODO: need to add the rest of the TAE augs for time inflation and weight loading
+# NOQA DONE: need to add the rest of the TAE augs for time inflation and weight loading
 # NOQA TODO: review all REVISIT tags
 # NOQA TODO: dataloader also empty, fill that
 # NOQA TODO: DDP is copied naively from llm.c - confirm
@@ -497,16 +497,16 @@ class TextEncoder(nn.Module):
 @dataclass
 class TAEConfig:
     version: str = "1.0"
-    embed_dim: int = 3
+    embed_dim: int = 16
     z_channels: int = 16
-    double_z: bool = False  # Different from original work of False
+    double_z: bool = True
     resolution: int = 256
     in_channels: int = 3
     out_ch: int = 3
     ch: int = 128
-    ch_mult: List[int] = [1, 1, 2, 2, 4]  # num_down = len(ch_mult)-1
+    ch_mult: Tuple[int] = (1, 1, 2, 2, 4)  # num_down = len(ch_mult)-1
     num_res_blocks: int = 2
-    attn_resolutions: List[int] = [16]
+    attn_resolutions: Tuple[int] = (16,)
     dropout: float = 0.0
 
     def __init__(self, **kwargs):
@@ -519,27 +519,30 @@ class TAE(nn.Module):
     def __init__(self, config: TAEConfig):
         super().__init__()
         self.config = config
-        self.encoder = Encoder(
+        self.encoder = TemporalEncoder(
             ch=config.ch,
             out_ch=config.out_ch,
             ch_mult=config.ch_mult,
             num_res_blocks=config.num_res_blocks,
             dropout=config.dropout,
+            embed_dim=config.embed_dim,
             in_channels=config.in_channels,
             resolution=config.resolution,
             z_channels=config.z_channels,
-            double_z=config.double_z,)
-        self.decoder = Decoder(
+            double_z=config.double_z,
+            attn_resolutions=config.attn_resolutions)
+        self.decoder = TemporalDecoder(
             ch=config.ch,
             out_ch=config.out_ch,
             ch_mult=config.ch_mult,
             num_res_blocks=config.num_res_blocks,
-            attn_resolutions=config.attn_resolutions,
+            embed_dim=config.embed_dim,
             dropout=config.dropout,
             in_channels=config.in_channels,
             resolution=config.resolution,
             z_channels=config.z_channels,
-            double_z=config.double_z,)
+            double_z=config.double_z,
+            attn_resolutions=config.attn_resolutions)
 
         self.quant_conv = torch.nn.Conv2d(
             2 * config.z_channels, 2 * config.embed_dim, 1)
@@ -552,8 +555,17 @@ class TAE(nn.Module):
     def loss(self, *args, **kwargs):
         raise NotImplementedError("VAE training not supported")
 
-    def from_pretrained(self, ckpt: Path, ignore_keys=list()):
+    def from_pretrained(self, ckpt: Path):
         sd = torch.load(ckpt, map_location="cpu")["state_dict"]
+        for k in list(sd.keys()):
+            if k.startswith("loss"):
+                del sd[k]
+
+        temp_sd = self.state_dict()
+        for k in temp_sd:
+            if "temp_" in k:
+                sd[k] = temp_sd[k]
+
         self.load_state_dict(sd, strict=True)
 
     def encode(self, x):
@@ -714,7 +726,7 @@ class MovieGen(nn.Module):
                         metaclip_ckpt: Path, tae_ckpt: Path):
         model_args = MovieGenConfig()
 
-        checkpoint = torch.load(ckpt, map_location="cpu", weights_only=True)
+        checkpoint = torch.load(ckpt, map_location="cpu")
 
         # save the default type
         original_default_type = torch.get_default_dtype()
