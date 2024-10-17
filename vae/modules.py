@@ -2,7 +2,6 @@
 source: https://github.com/CompVis/latent-diffusion
 """
 from collections import OrderedDict
-from typing import Tuple
 
 from einops import rearrange
 import torch.nn as nn
@@ -70,19 +69,23 @@ class Upsample(nn.Module):
                     in_channels, in_channels, kernel_size=3, stride=1)
 
     def forward(self, x):
+        B, T, C, H, W = x.shape
+        x = x.view(B * T, C, H, W)
         x = torch.nn.functional.interpolate(
-            x, scale_factor=2.0, mode="nearest")
+                x, scale_factor=2.0, mode="nearest")
+        _, C, H, W = x.shape
+        x = x.view(B, T, C, H, W)
         if self.with_conv:
             B, T, C, H, W = x.shape
             x = x.view(B * T, C, H, W)
             x = self.conv(x)
-            # REVISIT:
-            # temporal inflation
-            x = torch.nn.functional.interpolate(
-                x, scale_factor=2.0, mode="nearest")
             _, C, H, W = x.shape
             x = x.view(B, T, C, H, W).permute(0, 3, 4, 2, 1).contiguous()
             x = x.view(B * H * W, C, T)
+            # REVISIT:
+            if T > 1:  # don't upsample for images
+                x = torch.nn.functional.interpolate(
+                    x, scale_factor=2.0, mode="nearest")
             x = self.temp_conv(x)
             _, C, T = x.shape
             x = x.view(B, H, W, C, T).permute(0, 4, 3, 1, 2).contiguous()
@@ -231,12 +234,7 @@ class TemporalResnetBlock(nn.Module):
                 _, C, T = x.shape
                 x = x.view(B, H, W, C, T).permute(0, 4, 3, 1, 2).contiguous()
 
-        try:
-            ret = x + h
-            return ret
-        except Exception:
-            import pdb
-            pdb.set_trace()
+        return x + h
 
 
 class TemporalAttention(nn.Module):
@@ -439,16 +437,22 @@ class TemporalEncoder(nn.Module):
         temb = None
 
         # downsampling
+        # NOTE: --------------
         B, T, C, H, W = x.shape
         x = x.view(B * T, C, H, W)
+        # NOTE: --------------
         hs = self.conv_in(x)
         # temporal inflation
+        # NOTE: --------------
         _, C, H, W = hs.shape
         hs = hs.view(B, T, C, H, W).permute(0, 3, 4, 2, 1).contiguous()
         hs = hs.view(B * H * W, C, T)
+        # NOTE: --------------
         hs = self.temp_conv_in(hs)
+        # NOTE: --------------
         _, C, T = hs.shape
         hs = hs.view(B, H, W, C, T).permute(0, 4, 3, 1, 2).contiguous()
+        # NOTE: --------------
         hs = [hs]
         for i_level in range(self.num_resolutions):
             for i_block in range(self.num_res_blocks):
@@ -596,15 +600,25 @@ class TemporalDecoder(nn.Module):
         temb = None
 
         # z to block_in
+        B, T, C, H, W = z.shape
+        z = z.view(B * T, C, H, W)
         h = self.conv_in(z)
         # temporal inflation
+        _, C, H, W = h.shape
+        h = h.view(B, T, C, H, W).permute(0, 3, 4, 2, 1).contiguous()
+        h = h.view(B * H * W, C, T)
         h = self.temp_conv_in(h)
+        _, C, T = h.shape
+        h = h.view(B, H, W, C, T).permute(0, 4, 3, 1, 2).contiguous()
 
         # middle
         h = self.mid.block_1(h, temb)
+        B, T, C, H, W = h.shape
+        h = h.view(B * T, C, H, W)
         h = self.mid.attn_1(h)
         # temporal inflation
         self.mid.temp_attn_1(h)
+        h = h.view(B, T, C, H, W)
         h = self.mid.block_2(h, temb)
 
         # upsampling
@@ -612,7 +626,10 @@ class TemporalDecoder(nn.Module):
             for i_block in range(self.num_res_blocks+1):
                 h = self.up[i_level].block[i_block](h, temb)
                 if len(self.up[i_level].attn) > 0:
+                    B, T, C, H, W = h.shape
+                    h = h.view(B * T, C, H, W)
                     h = self.up[i_level].attn[str(i_block)](h)
+                    h = h.view(B, T, C, H, W)
             if i_level != 0:
                 h = self.up[i_level].upsample(h)
 
@@ -620,12 +637,19 @@ class TemporalDecoder(nn.Module):
         if self.give_pre_end:
             return h
 
+        B, T, C, H, W = h.shape
+        h = h.view(B * T, C, H, W)
         h = self.norm_out(h)
         h = nonlinearity(h)
         h = self.conv_out(h)
 
         # temporal inflation
+        _, C, H, W = h.shape
+        h = h.view(B, T, C, H, W).permute(0, 3, 4, 2, 1).contiguous()
+        h = h.view(B * H * W, C, T)
         h = self.temp_conv_out(h)
         if self.tanh_out:
             h = torch.tanh(h)
+        _, C, T = h.shape
+        h = h.view(B, H, W, C, T).permute(0, 4, 3, 1, 2).contiguous()
         return h

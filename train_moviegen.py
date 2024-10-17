@@ -596,19 +596,25 @@ class TAE(nn.Module):
 
     def decode(self, z):
         # temporal accounting
-        b, t, h, w, c = z.shape
+        B, T, C, H, W = z.shape
+        z = z.view(B * T, C, H, W)
         z = self.post_quant_conv(z)
+        _, C, H, W = z.shape
+        z = z.view(B, T, C, H, W)
         dec = self.decoder(z)
         # temporal accounting
         return dec
 
     def forward(self, input, sample_posterior=True):
+        B, T, C, H, W = input.shape
         # temporal accounting
         posterior = self.encode(input)
         if sample_posterior:
             z = posterior.sample()
         else:
             z = posterior.mode()
+        BT, C, H, W = z.shape
+        z = z.view(B, -1, C, H, W)
         dec = self.decode(z)
         return dec, posterior
 
