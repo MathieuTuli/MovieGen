@@ -26,8 +26,8 @@ import torch.nn as nn
 import numpy as np
 import torch
 
-from vae.distributions import DiagonalGaussianDistribution
-from vae.modules import TemporalEncoder, TemporalDecoder
+from tae.distributions import DiagonalGaussianDistribution
+from tae.modules import TemporalEncoder, TemporalDecoder
 
 # NOQA TODO: dim issues for sure, need to test: particularly the cross attention I just plopped in there
 # NOQA TODO: conv3d patchifier also is naively wrote in from first paper reading: needs review
