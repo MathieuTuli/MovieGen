@@ -428,8 +428,8 @@ class Block(nn.Module):
         self.ln_2 = RMSNorm(config.n_embd, config.norm_eps)
         # TODO: Add cross attention here for prompt embd
         self.bd_cross_attn = BidirectionalCrossAttention(
-                dim=config.n_embd, heads=config.n_head,
-                dim_head=config.dim_head)
+            dim=config.n_embd, heads=config.n_head,
+            dim_head=config.dim_head)
         self.mlp = MLP(config)
 
     def forward(self, x, ctx, freqs_cis=None, start_pos=None, mask=None):
@@ -494,6 +494,7 @@ class TextEncoder(nn.Module):
         ul2_emb = self.metaclip(x)
         return torch.cat((ul2_emb, byt5_emb, ul2_emb))
 
+
 @dataclass
 class TAEConfig:
     version: str = "1.0"
@@ -508,6 +509,7 @@ class TAEConfig:
     num_res_blocks: int = 2
     attn_resolutions: Tuple[int] = (16,)
     dropout: float = 0.0
+    scale_factor: float = 1.
 
     def __init__(self, **kwargs):
         for k, v in kwargs.items():
@@ -549,6 +551,7 @@ class TAE(nn.Module):
         self.post_quant_conv = torch.nn.Conv2d(
             config.embed_dim, config.z_channels, 1)
         self.embed_dim = config.embed_dim
+        self.scale_factor = config.scale_factor
 
         # REVISIT: self.init_from_ckpt(ckpt_path, ignore_keys=ignore_keys)
 
@@ -557,6 +560,7 @@ class TAE(nn.Module):
 
     def from_pretrained(self, ckpt: Path):
         sd = torch.load(ckpt, map_location="cpu")["state_dict"]
+        # REVISIT: update this to train tae
         for k in list(sd.keys()):
             if k.startswith("loss"):
                 del sd[k]
@@ -568,18 +572,38 @@ class TAE(nn.Module):
 
         self.load_state_dict(sd, strict=True)
 
+    def get_encoding(self, encoder_posterior):
+        if isinstance(encoder_posterior, DiagonalGaussianDistribution):
+            z = encoder_posterior.sample()
+        elif isinstance(encoder_posterior, torch.Tensor):
+            z = encoder_posterior
+        else:
+            raise NotImplementedError(
+                "encoder_posterior of type " +
+                f"{type(encoder_posterior)} not yet implemented")
+        return self.scale_factor * z
+
     def encode(self, x):
-        h = self.encoder(x)
-        moments = self.quant_conv(h)
+        # temporal accounting
+        x = self.encoder(x)
+        B, T, C, H, W = x.shape
+        x = x.view(B * T, C, H, W)
+        moments = self.quant_conv(x)
+        # _, C, H, W = moments.shape
+        # moments = moments.view(B, T, C, H, W)
         posterior = DiagonalGaussianDistribution(moments)
         return posterior
 
     def decode(self, z):
+        # temporal accounting
+        b, t, h, w, c = z.shape
         z = self.post_quant_conv(z)
         dec = self.decoder(z)
+        # temporal accounting
         return dec
 
     def forward(self, input, sample_posterior=True):
+        # temporal accounting
         posterior = self.encode(input)
         if sample_posterior:
             z = posterior.sample()
