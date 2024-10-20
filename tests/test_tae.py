@@ -19,13 +19,22 @@ def test_tae_encoder():
     tae.from_pretrained("pretrained-weights/tae/model.ckpt")
     x = torch.zeros((3, 1, 3, 32, 32), device=device)  # [b, seq, c, w, h]
     x = tae.encode(x)
-    assert x.sample().shape[1] == 1
+    B, T, C, W, H = x.sample().shape
+    assert C == 1
+    assert W == 4
+    assert H == 4
     x = torch.zeros((3, 128, 3, 32, 32), device=device)  # [b, seq, c, w, h]
     x = tae.encode(x)
-    assert x.sample().shape[1] == 16 # 128 // 8
+    B, T, C, W, H = x.sample().shape
+    assert C == 16
+    assert W == 4
+    assert H == 4
     x = torch.zeros((3, 33, 3, 32, 32), device=device)  # [b, seq, c, w, h]
     x = tae.encode(x)
-    assert x.sample().shape[1] == 4  # 33 // 8
+    B, T, C, W, H = x.sample().shape
+    assert C == 4
+    assert W == 4
+    assert H == 4
     del tae, x
 
 
