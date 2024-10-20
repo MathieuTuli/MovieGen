@@ -66,13 +66,13 @@ class Upsample(nn.Module):
                                         padding=1)
             # temporal inflation
             self.temp_conv = TemporalConv1d(
-                    in_channels, in_channels, kernel_size=3, stride=1)
+                in_channels, in_channels, kernel_size=3, stride=1)
 
     def forward(self, x):
         B, T, C, H, W = x.shape
         x = x.view(B * T, C, H, W)
         x = torch.nn.functional.interpolate(
-                x, scale_factor=2.0, mode="nearest")
+            x, scale_factor=2.0, mode="nearest")
         _, C, H, W = x.shape
         x = x.view(B, T, C, H, W)
         if self.with_conv:
@@ -105,7 +105,7 @@ class Downsample(nn.Module):
                                         padding=0)
             # temporal inflation
             self.temp_conv = TemporalConv1d(
-                   in_channels, in_channels, kernel_size=3, stride=2)
+                in_channels, in_channels, kernel_size=3, stride=2)
 
     def forward(self, x):
         if self.with_conv:
@@ -143,7 +143,7 @@ class TemporalResnetBlock(nn.Module):
                                      padding=1)
         # temporal inflation
         self.temp_conv1 = TemporalConv1d(
-                out_channels, out_channels, kernel_size=3, stride=1)
+            out_channels, out_channels, kernel_size=3, stride=1)
         if temb_channels > 0:
             self.temb_proj = torch.nn.Linear(temb_channels,
                                              out_channels)
@@ -156,7 +156,7 @@ class TemporalResnetBlock(nn.Module):
                                      padding=1)
         # temporal inflation
         self.temp_conv2 = TemporalConv1d(
-                out_channels, out_channels, kernel_size=3, stride=1)
+            out_channels, out_channels, kernel_size=3, stride=1)
         if self.in_channels != self.out_channels:
             if self.use_conv_shortcut:
                 self.conv_shortcut = torch.nn.Conv2d(in_channels,
@@ -165,8 +165,8 @@ class TemporalResnetBlock(nn.Module):
                                                      stride=1,
                                                      padding=1)
                 self.temp_conv_shortcut = TemporalConv1d(
-                        out_channels, out_channels,
-                        kernel_size=3, stride=1)
+                    out_channels, out_channels,
+                    kernel_size=3, stride=1)
             else:
                 self.nin_shortcut = torch.nn.Conv2d(in_channels,
                                                     out_channels,
@@ -174,10 +174,9 @@ class TemporalResnetBlock(nn.Module):
                                                     stride=1,
                                                     padding=0)
                 # temporal inflation
-                # REVISIT: needed?
                 self.temp_conv_shortcut = TemporalConv1d(
-                        out_channels, out_channels,
-                        kernel_size=1, stride=1, padding=0)
+                    out_channels, out_channels,
+                    kernel_size=1, stride=1, padding=0)
 
     def forward(self, x, temb):
         h = x
@@ -238,30 +237,59 @@ class TemporalResnetBlock(nn.Module):
 
 
 class TemporalAttention(nn.Module):
-    def __init__(self, dim, heads=1):
+    def __init__(self, in_channels):
         super().__init__()
-        self.heads = heads
-        self.dim_head = dim_head = dim
-        hidden_dim = dim_head * heads
-        self.to_qkv = nn.Linear(dim, hidden_dim * 3)
-        self.to_out = nn.Linear(hidden_dim, dim)
+        self.in_channels = in_channels
+
+        self.norm = Normalize(in_channels)
+        self.q = TemporalConv1d(in_channels,
+                                in_channels,
+                                kernel_size=1,
+                                stride=1,
+                                padding=0)
+        self.k = TemporalConv1d(in_channels,
+                                in_channels,
+                                kernel_size=1,
+                                stride=1,
+                                padding=0)
+        self.v = TemporalConv1d(in_channels,
+                                in_channels,
+                                kernel_size=1,
+                                stride=1,
+                                padding=0)
+        self.proj_out = TemporalConv1d(in_channels,
+                                       in_channels,
+                                       kernel_size=1,
+                                       stride=1,
+                                       padding=0)
 
     def forward(self, x):
-        return x
-        # REVISIT:
-        bt, c, h, w = x.shape
-        # x = x.permute(0, 2, 3, 4, 1).reshape(b * h * w, t, c)
-        x = x.permute(0, 2, 3, 1).reshape(bt * h * w, c)
-        qkv = self.to_qkv(x).chunk(3, dim=-1)
-        q, k, v = map(lambda t: rearrange(
-            t, 'b n (h d) -> b h n d', h=self.heads), qkv)
-        dots = torch.matmul(q, k.transpose(-1, -2)) * (self.dim_head ** -0.5)
-        attn = dots.softmax(dim=-1)
-        out = torch.matmul(attn, v)
-        out = rearrange(out, 'b h n d -> b n (h d)')
-        out = self.to_out(out)
-        # out.reshape(b, h, w, t, c).permute(0, 4, 1, 2, 3)
-        return out.reshape(bt, h, w, c).permute(0, 3, 1, 2)
+        # REVISIT: confirm attention shapes
+        h_ = x
+        B, T, C, H, W = h_.shape
+        h_ = h_.permute(0, 3, 4, 2, 1).contiguous().view(B * H * W, C, T)
+        h_ = self.norm(h_)
+        q = self.q(h_)
+        k = self.k(h_)
+        v = self.v(h_)
+
+        # compute attention
+        # REVISIT: confirm attention shapes
+        b, c, t = q.shape
+        q = q.permute(0, 2, 1)   # b,t,c
+        w_ = torch.bmm(q, k)     # b,t,t   w[b,i,j]=sum_c q[b,i,c]k[b,c,j]
+        w_ = w_ * (int(c)**(-0.5))
+        w_ = torch.nn.functional.softmax(w_, dim=2)
+
+        # attend to values
+        w_ = w_.permute(0, 2, 1)   # b,,t (first hw of k, second of q)
+        # b, c,hw (hw of q) h_[b,c,j] = sum_i v[b,c,i] w_[b,i,j]
+        h_ = torch.bmm(v, w_)
+
+        h_ = self.proj_out(h_)
+        _, C, T = h_.shape
+        h_ = h_.view(B, H, W, C, T).permute(0, 4, 3, 1, 2).contiguous()
+        return x + h_
 
 
 class LinAttnBlock(LinearAttention):
@@ -300,6 +328,8 @@ class AttnBlock(nn.Module):
 
     def forward(self, x):
         h_ = x
+        B, T, C, H, W = h_.shape
+        h_ = h_.view(B * T, C, H, W)
         h_ = self.norm(h_)
         q = self.q(h_)
         k = self.k(h_)
@@ -322,6 +352,7 @@ class AttnBlock(nn.Module):
         h_ = h_.reshape(b, c, h, w)
 
         h_ = self.proj_out(h_)
+        h_ = h_.view(B, T, C, H, W)
 
         return x+h_
 
@@ -372,8 +403,7 @@ class TemporalEncoder(nn.Module):
                                        padding=1)
         # temporal inflation
         self.temp_conv_in = TemporalConv1d(
-                self.ch, self.ch, kernel_size=3, stride=1)
-
+            self.ch, self.ch, kernel_size=3, stride=1)
 
         curr_res = resolution
         in_ch_mult = (1,)+tuple(ch_mult)
@@ -392,12 +422,12 @@ class TemporalEncoder(nn.Module):
                 block_in = block_out
                 if curr_res in attn_resolutions:
                     attn_dict.update(
-                            {str(i_block): make_attn(block_in,
-                                                     attn_type=attn_type)})
+                        {str(i_block): make_attn(block_in,
+                                                 attn_type=attn_type)})
                     # temporal inflation
                     attn_dict.update(
-                            {f"temp_attn_{i_block}": TemporalAttention(
-                                block_in)})
+                        {f"temp_attn_{i_block}": TemporalAttention(
+                            block_in)})
             down = nn.Module()
             down.block = block
             down.attn = nn.ModuleDict(attn_dict)
@@ -430,38 +460,31 @@ class TemporalEncoder(nn.Module):
                                         padding=1)
         # temporal inflation
         self.temp_conv_out = TemporalConv1d(
-                block_out, block_out, kernel_size=3, stride=1)
+            block_out, block_out, kernel_size=3, stride=1)
 
     def forward(self, x):
         # timestep embedding
         temb = None
 
         # downsampling
-        # NOTE: --------------
         B, T, C, H, W = x.shape
         x = x.view(B * T, C, H, W)
-        # NOTE: --------------
         hs = self.conv_in(x)
         # temporal inflation
-        # NOTE: --------------
         _, C, H, W = hs.shape
         hs = hs.view(B, T, C, H, W).permute(0, 3, 4, 2, 1).contiguous()
         hs = hs.view(B * H * W, C, T)
-        # NOTE: --------------
         hs = self.temp_conv_in(hs)
-        # NOTE: --------------
         _, C, T = hs.shape
-        hs = hs.view(B, H, W, C, T).permute(0, 4, 3, 1, 2).contiguous()
-        # NOTE: --------------
-        hs = [hs]
+        hs = [hs.view(B, H, W, C, T).permute(0, 4, 3, 1, 2).contiguous()]
         for i_level in range(self.num_resolutions):
             for i_block in range(self.num_res_blocks):
                 h = self.down[i_level].block[i_block](hs[-1], temb)
                 if len(self.down[i_level].attn) > 0:
-                    B, T, C, H, W = h.shape
-                    h = h.view(B * T, C, H, W)
+                    # B, T, C, H, W = h.shape
+                    # h = h.view(B * T, C, H, W)
                     h = self.down[i_level].attn[str(i_block)](h)
-                    h = h.view(B, T, C, H, W)
+                    # h = h.view(B, T, C, H, W)
                 hs.append(h)
             if i_level != self.num_resolutions-1:
                 hs.append(self.down[i_level].downsample(hs[-1]))
@@ -469,12 +492,12 @@ class TemporalEncoder(nn.Module):
         # middle
         h = hs[-1]
         h = self.mid.block_1(h, temb)
-        B, T, C, H, W = h.shape
-        h = h.view(B * T, C, H, W)
+        # B, T, C, H, W = h.shape
+        # h = h.view(B * T, C, H, W)
         h = self.mid.attn_1(h)
         # temporal inflation
         h = self.mid.temp_attn_1(h)
-        h = h.view(B, T, C, H, W)
+        # h = h.view(B, T, C, H, W)
         h = self.mid.block_2(h, temb)
 
         # end
@@ -537,7 +560,7 @@ class TemporalDecoder(nn.Module):
                                        padding=1)
         # temporal inflation
         self.temp_conv_in = TemporalConv1d(
-                block_in, block_in, kernel_size=3, stride=1)
+            block_in, block_in, kernel_size=3, stride=1)
 
         # middle
         self.mid = nn.Module()
@@ -567,12 +590,12 @@ class TemporalDecoder(nn.Module):
                 block_in = block_out
                 if curr_res in attn_resolutions:
                     attn_dict.update(
-                            {str(i_block): make_attn(block_in,
-                                                     attn_type=attn_type)})
+                        {str(i_block): make_attn(block_in,
+                                                 attn_type=attn_type)})
                     # temporal inflation
                     attn_dict.update(
-                            {f"temp_attn_{i_block}": TemporalAttention(
-                                block_in)})
+                        {f"temp_attn_{i_block}": TemporalAttention(
+                            block_in)})
             up = nn.Module()
             up.block = block
             up.attn = nn.ModuleDict(attn_dict)
@@ -590,7 +613,7 @@ class TemporalDecoder(nn.Module):
                                         padding=1)
         # temporal inflation
         self.temp_conv_out = TemporalConv1d(
-                out_ch, out_ch, kernel_size=3, stride=1)
+            out_ch, out_ch, kernel_size=3, stride=1)
 
     def forward(self, z):
         # assert z.shape[1:] == self.z_shape[1:]
@@ -613,12 +636,12 @@ class TemporalDecoder(nn.Module):
 
         # middle
         h = self.mid.block_1(h, temb)
-        B, T, C, H, W = h.shape
-        h = h.view(B * T, C, H, W)
+        # B, T, C, H, W = h.shape
+        # h = h.view(B * T, C, H, W)
         h = self.mid.attn_1(h)
         # temporal inflation
         self.mid.temp_attn_1(h)
-        h = h.view(B, T, C, H, W)
+        # h = h.view(B, T, C, H, W)
         h = self.mid.block_2(h, temb)
 
         # upsampling
@@ -626,10 +649,10 @@ class TemporalDecoder(nn.Module):
             for i_block in range(self.num_res_blocks+1):
                 h = self.up[i_level].block[i_block](h, temb)
                 if len(self.up[i_level].attn) > 0:
-                    B, T, C, H, W = h.shape
-                    h = h.view(B * T, C, H, W)
+                    # B, T, C, H, W = h.shape
+                    # h = h.view(B * T, C, H, W)
                     h = self.up[i_level].attn[str(i_block)](h)
-                    h = h.view(B, T, C, H, W)
+                    # h = h.view(B, T, C, H, W)
             if i_level != 0:
                 h = self.up[i_level].upsample(h)
 
