@@ -264,6 +264,7 @@ class TemporalAttention(nn.Module):
                                        padding=0)
 
     def forward(self, x):
+        return x
         # REVISIT: confirm attention shapes
         h_ = x
         B, T, C, H, W = h_.shape

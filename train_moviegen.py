@@ -589,8 +589,9 @@ class TAE(nn.Module):
         B, T, C, H, W = x.shape
         x = x.view(B * T, C, H, W)
         moments = self.quant_conv(x)
-        # _, C, H, W = moments.shape
-        # moments = moments.view(B, T, C, H, W)
+        _, C, H, W = moments.shape
+        moments = moments.view(B, T, C, H, W)
+        # REVISIT: this
         posterior = DiagonalGaussianDistribution(moments)
         return posterior
 

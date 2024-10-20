@@ -8,7 +8,8 @@ import torch
 class DiagonalGaussianDistribution:
     def __init__(self, parameters, deterministic=False):
         self.parameters = parameters
-        self.mean, self.logvar = torch.chunk(parameters, 2, dim=1)
+        # REVISIT: changed to handle temporal dimension from dim=1 to 2
+        self.mean, self.logvar = torch.chunk(parameters, 2, dim=2)
         self.logvar = torch.clamp(self.logvar, -30.0, 20.0)
         self.deterministic = deterministic
         self.std = torch.exp(0.5 * self.logvar)
