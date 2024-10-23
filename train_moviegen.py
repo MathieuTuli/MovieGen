@@ -565,29 +565,15 @@ class TAE(nn.Module):
         raise NotImplementedError("VAE training not supported")
 
     def from_pretrained(self, ckpt: Path,
-                        ignore_keys: List[str] = None,
-                        interpolate_keys: List[str] = None):
+                        ignore_keys: List[str] = None,):
         ignore_keys = ignore_keys or list()
-        interpolate_keys = interpolate_keys or list()
         sd = torch.load(ckpt, map_location="cpu")["state_dict"]
         keys = list(sd.keys())
-
-        def rgetattr(obj, attr, *args):
-            def _getattr(obj, attr):
-                return getattr(obj, attr, *args)
-            return functools.reduce(_getattr, [obj] + attr.split('.'))
-
         for k in keys:
             for ik in ignore_keys:
                 if k.startswith(ik):
                     print("Deleting key {} from state_dict.".format(k))
                     del sd[k]
-            for ik in interpolate_keys:
-                if k.startswith(ik):
-                    tgt_shape = rgetattr(self, k).shape
-                    import pdb
-                    pdb.set_trace()
-                    sd[k] = torch.nn.functional.interpolate(sd[k], tgt_shape)
 
         # REVISIT: update this to train tae
         for k in list(sd.keys()):

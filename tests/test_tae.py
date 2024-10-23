@@ -5,7 +5,7 @@ def test_tae_weight_loading():
     tae_config = TAEConfig()
     tae = TAE(tae_config)
     tae.from_pretrained("pretrained-weights/tae/model.ckpt",
-                        interpolate_keys=[
+                        ignore_keys=[
                             "encoder.conv_out",
                             "decoder.conv_in",
                             "quant_conv",
