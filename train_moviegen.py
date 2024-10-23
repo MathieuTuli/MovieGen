@@ -6,9 +6,10 @@ References:
 """
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Tuple, List
 from pathlib import Path
 
+import functools
 import argparse
 import inspect
 import time
@@ -505,11 +506,13 @@ class TAEConfig:
     in_channels: int = 3
     out_ch: int = 3
     ch: int = 128
-    ch_mult: Tuple[int] = (1, 1, 2, 2, 4)  # num_down = len(ch_mult)-1
+    ch_mult: Tuple[int] = (1, 2, 4, 4)  # num_down = len(ch_mult)-1
+    temporal_scaling_offset: int = 0
     num_res_blocks: int = 2
-    attn_resolutions: Tuple[int] = (16,)
+    attn_resolutions: Tuple[int] = tuple()
     dropout: float = 0.0
     scale_factor: float = 1.
+    strict: bool = False
 
     def __init__(self, **kwargs):
         for k, v in kwargs.items():
@@ -525,6 +528,7 @@ class TAE(nn.Module):
             ch=config.ch,
             out_ch=config.out_ch,
             ch_mult=config.ch_mult,
+            temporal_scaling_offset=config.temporal_scaling_offset,
             num_res_blocks=config.num_res_blocks,
             dropout=config.dropout,
             embed_dim=config.embed_dim,
@@ -537,6 +541,7 @@ class TAE(nn.Module):
             ch=config.ch,
             out_ch=config.out_ch,
             ch_mult=config.ch_mult,
+            temporal_scaling_offset=config.temporal_scaling_offset,
             num_res_blocks=config.num_res_blocks,
             embed_dim=config.embed_dim,
             dropout=config.dropout,
@@ -545,6 +550,7 @@ class TAE(nn.Module):
             z_channels=config.z_channels,
             double_z=config.double_z,
             attn_resolutions=config.attn_resolutions)
+        self.strict = config.strict
 
         self.quant_conv = torch.nn.Conv2d(
             2 * config.z_channels, 2 * config.embed_dim, 1)
@@ -558,8 +564,31 @@ class TAE(nn.Module):
     def loss(self, *args, **kwargs):
         raise NotImplementedError("VAE training not supported")
 
-    def from_pretrained(self, ckpt: Path):
+    def from_pretrained(self, ckpt: Path,
+                        ignore_keys: List[str] = None,
+                        interpolate_keys: List[str] = None):
+        ignore_keys = ignore_keys or list()
+        interpolate_keys = interpolate_keys or list()
         sd = torch.load(ckpt, map_location="cpu")["state_dict"]
+        keys = list(sd.keys())
+
+        def rgetattr(obj, attr, *args):
+            def _getattr(obj, attr):
+                return getattr(obj, attr, *args)
+            return functools.reduce(_getattr, [obj] + attr.split('.'))
+
+        for k in keys:
+            for ik in ignore_keys:
+                if k.startswith(ik):
+                    print("Deleting key {} from state_dict.".format(k))
+                    del sd[k]
+            for ik in interpolate_keys:
+                if k.startswith(ik):
+                    tgt_shape = rgetattr(self, k).shape
+                    import pdb
+                    pdb.set_trace()
+                    sd[k] = torch.nn.functional.interpolate(sd[k], tgt_shape)
+
         # REVISIT: update this to train tae
         for k in list(sd.keys()):
             if k.startswith("loss"):
@@ -570,7 +599,7 @@ class TAE(nn.Module):
             if "temp_" in k:
                 sd[k] = temp_sd[k]
 
-        self.load_state_dict(sd, strict=True)
+        self.load_state_dict(sd, strict=self.strict)
 
     def get_encoding(self, encoder_posterior):
         if isinstance(encoder_posterior, DiagonalGaussianDistribution):
@@ -614,8 +643,7 @@ class TAE(nn.Module):
             z = posterior.sample()
         else:
             z = posterior.mode()
-        BT, C, H, W = z.shape
-        z = z.view(B, -1, C, H, W)
+        B, T, C, H, W = z.shape
         dec = self.decode(z)
         return dec, posterior
 

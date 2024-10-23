@@ -55,7 +55,7 @@ class LinearAttention(nn.Module):
 
 
 class Upsample(nn.Module):
-    def __init__(self, in_channels, with_conv):
+    def __init__(self, in_channels, with_conv, with_temporal):
         super().__init__()
         self.with_conv = with_conv
         if self.with_conv:
@@ -65,8 +65,10 @@ class Upsample(nn.Module):
                                         stride=1,
                                         padding=1)
             # temporal inflation
-            self.temp_conv = TemporalConv1d(
-                in_channels, in_channels, kernel_size=3, stride=1)
+            self.temp_conv = None
+            if with_temporal:
+                self.temp_conv = TemporalConv1d(
+                    in_channels, in_channels, kernel_size=3, stride=1)
 
     def forward(self, x):
         B, T, C, H, W = x.shape
@@ -83,17 +85,17 @@ class Upsample(nn.Module):
             x = x.view(B, T, C, H, W).permute(0, 3, 4, 2, 1).contiguous()
             x = x.view(B * H * W, C, T)
             # REVISIT:
-            if T > 1:  # don't upsample for images
+            if self.temp_conv is not None:
                 x = torch.nn.functional.interpolate(
                     x, scale_factor=2.0, mode="nearest")
-            x = self.temp_conv(x)
+                x = self.temp_conv(x)
             _, C, T = x.shape
             x = x.view(B, H, W, C, T).permute(0, 4, 3, 1, 2).contiguous()
         return x
 
 
 class Downsample(nn.Module):
-    def __init__(self, in_channels, with_conv):
+    def __init__(self, in_channels, with_conv, with_temporal):
         super().__init__()
         self.with_conv = with_conv
         if self.with_conv:
@@ -104,8 +106,10 @@ class Downsample(nn.Module):
                                         stride=2,
                                         padding=0)
             # temporal inflation
-            self.temp_conv = TemporalConv1d(
-                in_channels, in_channels, kernel_size=3, stride=2)
+            self.temp_conv = None
+            if with_temporal:
+                self.temp_conv = TemporalConv1d(
+                    in_channels, in_channels, kernel_size=3, stride=2)
 
     def forward(self, x):
         if self.with_conv:
@@ -118,7 +122,8 @@ class Downsample(nn.Module):
             _, C, H, W = x.shape
             x = x.view(B, T, C, H, W).permute(0, 3, 4, 2, 1).contiguous()
             x = x.view(B * H * W, C, T)
-            x = self.temp_conv(x)
+            if self.temp_conv is not None:
+                x = self.temp_conv(x)
             _, C, T = x.shape
             x = x.view(B, H, W, C, T).permute(0, 4, 3, 1, 2).contiguous()
         else:
@@ -375,6 +380,7 @@ class TemporalEncoder(nn.Module):
                  ch,
                  out_ch,
                  ch_mult=(1, 2, 4, 8),
+                 temporal_scaling_offset,
                  num_res_blocks,
                  attn_resolutions,
                  dropout=0.0,
@@ -432,8 +438,10 @@ class TemporalEncoder(nn.Module):
             down = nn.Module()
             down.block = block
             down.attn = nn.ModuleDict(attn_dict)
-            if i_level != self.num_resolutions-1:
-                down.downsample = Downsample(block_in, resamp_with_conv)
+            if i_level != self.num_resolutions - 1:
+                down.downsample = Downsample(
+                    block_in, resamp_with_conv,
+                    i_level < self.num_resolutions - temporal_scaling_offset)  # NOQA
                 curr_res = curr_res // 2
             self.down.append(down)
 
@@ -523,6 +531,7 @@ class TemporalDecoder(nn.Module):
                  ch,
                  out_ch,
                  ch_mult=(1, 2, 4, 8),
+                 temporal_scaling_offset,
                  num_res_blocks,
                  attn_resolutions,
                  dropout=0.0,
@@ -601,7 +610,9 @@ class TemporalDecoder(nn.Module):
             up.block = block
             up.attn = nn.ModuleDict(attn_dict)
             if i_level != 0:
-                up.upsample = Upsample(block_in, resamp_with_conv)
+                up.upsample = Upsample(
+                    block_in, resamp_with_conv,
+                    i_level >= temporal_scaling_offset)
                 curr_res = curr_res * 2
             self.up.insert(0, up)  # prepend to get consistent order
 

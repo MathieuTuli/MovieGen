@@ -7,8 +7,8 @@ mkdir pretrained-weights/metaclip
 
 # TAE
 cd pretrained-weights/tae
-wget https://ommer-lab.com/files/latent-diffusion/kl-f16.zip
-unzip kl-f16.zip
+wget https://ommer-lab.com/files/latent-diffusion/kl-f8.zip
+unzip kl-f8.zip
 cd ../..
 
 # ul2
