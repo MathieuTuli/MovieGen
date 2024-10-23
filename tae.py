@@ -2,9 +2,13 @@
 source: https://github.com/CompVis/latent-diffusion
 """
 from collections import OrderedDict
+from dataclasses import dataclass
+from typing import Tuple, List
+from pathlib import Path
 
 from einops import rearrange
 import torch.nn as nn
+import numpy as np
 import torch
 
 
@@ -688,3 +692,253 @@ class TemporalDecoder(nn.Module):
         _, C, T = h.shape
         h = h.view(B, H, W, C, T).permute(0, 4, 3, 1, 2).contiguous()
         return h
+
+
+class DiagonalGaussianDistribution:
+    def __init__(self, parameters, deterministic=False):
+        self.parameters = parameters
+        # REVISIT: changed to handle temporal dimension from dim=1 to 2
+        self.mean, self.logvar = torch.chunk(parameters, 2, dim=2)
+        self.logvar = torch.clamp(self.logvar, -30.0, 20.0)
+        self.deterministic = deterministic
+        self.std = torch.exp(0.5 * self.logvar)
+        self.var = torch.exp(self.logvar)
+        if self.deterministic:
+            self.var = self.std = torch.zeros_like(
+                self.mean).to(device=self.parameters.device)
+
+    def sample(self):
+        x = self.mean + self.std * torch.randn(
+            self.mean.shape).to(device=self.parameters.device)
+        return x
+
+    def kl(self, other=None):
+        if self.deterministic:
+            return torch.Tensor([0.])
+        else:
+            if other is None:
+                return 0.5 * torch.sum(torch.pow(self.mean, 2)
+                                       + self.var - 1.0 - self.logvar,
+                                       dim=[1, 2, 3])
+            else:
+                return 0.5 * torch.sum(
+                    torch.pow(self.mean - other.mean, 2) / other.var
+                    + self.var / other.var - 1.0 - self.logvar + other.logvar,
+                    dim=[1, 2, 3])
+
+    def nll(self, sample, dims=[1, 2, 3]):
+        if self.deterministic:
+            return torch.Tensor([0.])
+        logtwopi = np.log(2.0 * np.pi)
+        return 0.5 * torch.sum(
+            logtwopi + self.logvar +
+            torch.pow(sample - self.mean, 2) / self.var,
+            dim=dims)
+
+    def mode(self):
+        return self.mean
+
+
+@dataclass
+class TAEConfig:
+    version: str = "1.0"
+    embed_dim: int = 16
+    z_channels: int = 16
+    double_z: bool = True
+    resolution: int = 256
+    in_channels: int = 3
+    out_ch: int = 3
+    ch: int = 128
+    ch_mult: Tuple[int] = (1, 2, 4, 4)  # num_down = len(ch_mult)-1
+    temporal_scaling_offset: int = 0
+    num_res_blocks: int = 2
+    attn_resolutions: Tuple[int] = tuple()
+    dropout: float = 0.0
+    scale_factor: float = 1.
+    strict: bool = False
+
+    def __init__(self, **kwargs):
+        for k, v in kwargs.items():
+            if hasattr(self, k):
+                setattr(self, k, v)
+
+
+class TAE(nn.Module):
+    def __init__(self, config: TAEConfig):
+        super().__init__()
+        self.config = config
+        self.encoder = TemporalEncoder(
+            ch=config.ch,
+            out_ch=config.out_ch,
+            ch_mult=config.ch_mult,
+            temporal_scaling_offset=config.temporal_scaling_offset,
+            num_res_blocks=config.num_res_blocks,
+            dropout=config.dropout,
+            embed_dim=config.embed_dim,
+            in_channels=config.in_channels,
+            resolution=config.resolution,
+            z_channels=config.z_channels,
+            double_z=config.double_z,
+            attn_resolutions=config.attn_resolutions)
+        self.decoder = TemporalDecoder(
+            ch=config.ch,
+            out_ch=config.out_ch,
+            ch_mult=config.ch_mult,
+            temporal_scaling_offset=config.temporal_scaling_offset,
+            num_res_blocks=config.num_res_blocks,
+            embed_dim=config.embed_dim,
+            dropout=config.dropout,
+            in_channels=config.in_channels,
+            resolution=config.resolution,
+            z_channels=config.z_channels,
+            double_z=config.double_z,
+            attn_resolutions=config.attn_resolutions)
+        self.strict = config.strict
+
+        self.quant_conv = torch.nn.Conv2d(
+            2 * config.z_channels, 2 * config.embed_dim, 1)
+        self.post_quant_conv = torch.nn.Conv2d(
+            config.embed_dim, config.z_channels, 1)
+        self.embed_dim = config.embed_dim
+        self.scale_factor = config.scale_factor
+
+        # REVISIT: self.init_from_ckpt(ckpt_path, ignore_keys=ignore_keys)
+
+    def loss(self, *args, **kwargs):
+        raise NotImplementedError("VAE training not supported")
+
+    def from_pretrained(self, ckpt: Path,
+                        ignore_keys: List[str] = None,):
+        ignore_keys = ignore_keys or list()
+        sd = torch.load(ckpt, map_location="cpu")["state_dict"]
+        keys = list(sd.keys())
+        for k in keys:
+            for ik in ignore_keys:
+                if k.startswith(ik):
+                    print("Deleting key {} from state_dict.".format(k))
+                    del sd[k]
+
+        # REVISIT: update this to train tae
+        for k in list(sd.keys()):
+            if k.startswith("loss"):
+                del sd[k]
+
+        temp_sd = self.state_dict()
+        for k in temp_sd:
+            if "temp_" in k:
+                sd[k] = temp_sd[k]
+
+        self.load_state_dict(sd, strict=self.strict)
+
+    def get_encoding(self, encoder_posterior):
+        if isinstance(encoder_posterior, DiagonalGaussianDistribution):
+            z = encoder_posterior.sample()
+        elif isinstance(encoder_posterior, torch.Tensor):
+            z = encoder_posterior
+        else:
+            raise NotImplementedError(
+                "encoder_posterior of type " +
+                f"{type(encoder_posterior)} not yet implemented")
+        return self.scale_factor * z
+
+    def encode(self, x):
+        # temporal accounting
+        x = self.encoder(x)
+        B, T, C, H, W = x.shape
+        x = x.view(B * T, C, H, W)
+        moments = self.quant_conv(x)
+        _, C, H, W = moments.shape
+        moments = moments.view(B, T, C, H, W)
+        # REVISIT: this
+        posterior = DiagonalGaussianDistribution(moments)
+        return posterior
+
+    def decode(self, z):
+        # temporal accounting
+        B, T, C, H, W = z.shape
+        z = z.view(B * T, C, H, W)
+        z = self.post_quant_conv(z)
+        _, C, H, W = z.shape
+        z = z.view(B, T, C, H, W)
+        dec = self.decoder(z)
+        # temporal accounting
+        return dec
+
+    def forward(self, input, sample_posterior=True):
+        B, T, C, H, W = input.shape
+        # temporal accounting
+        posterior = self.encode(input)
+        if sample_posterior:
+            z = posterior.sample()
+        else:
+            z = posterior.mode()
+        B, T, C, H, W = z.shape
+        dec = self.decode(z)
+        return dec, posterior
+
+    def get_input(self, batch, k):
+        x = batch[k]
+        if len(x.shape) == 3:
+            x = x[..., None]
+        x = x.permute(0, 3, 1, 2).to(
+            memory_format=torch.contiguous_format).float()
+        return x
+
+    def training_step(self, batch, batch_idx, optimizer_idx):
+        inputs = self.get_input(batch, self.image_key)
+        reconstructions, posterior = self(inputs)
+
+        if optimizer_idx == 0:
+            # train encoder+decoder+logvar
+            aeloss, log_dict_ae = self.loss(
+                inputs, reconstructions, posterior, optimizer_idx,
+                self.global_step, last_layer=self.get_last_layer(),
+                split="train")
+            self.log("aeloss", aeloss, prog_bar=True,
+                     logger=True, on_step=True, on_epoch=True)
+            self.log_dict(log_dict_ae, prog_bar=False,
+                          logger=True, on_step=True, on_epoch=False)
+            return aeloss
+
+        if optimizer_idx == 1:
+            # train the discriminator
+            discloss, log_dict_disc = self.loss(
+                inputs, reconstructions, posterior, optimizer_idx,
+                self.global_step, last_layer=self.get_last_layer(),
+                split="train")
+
+            self.log("discloss", discloss, prog_bar=True,
+                     logger=True, on_step=True, on_epoch=True)
+            self.log_dict(log_dict_disc, prog_bar=False,
+                          logger=True, on_step=True, on_epoch=False)
+            return discloss
+
+    def validation_step(self, batch, batch_idx):
+        inputs = self.get_input(batch, self.image_key)
+        reconstructions, posterior = self(inputs)
+        aeloss, log_dict_ae = self.loss(
+            inputs, reconstructions, posterior, 0, self.global_step,
+            last_layer=self.get_last_layer(), split="val")
+
+        discloss, log_dict_disc = self.loss(
+            inputs, reconstructions, posterior, 1, self.global_step,
+            last_layer=self.get_last_layer(), split="val")
+
+        self.log("val/rec_loss", log_dict_ae["val/rec_loss"])
+        self.log_dict(log_dict_ae)
+        self.log_dict(log_dict_disc)
+        return self.log_dict
+
+    def configure_optimizers(self):
+        lr = self.learning_rate
+        opt_ae = torch.optim.Adam(list(self.encoder.parameters()) +
+                                  list(self.decoder.parameters()) +
+                                  list(self.quant_conv.parameters()) +
+                                  list(self.post_quant_conv.parameters()),
+                                  lr=lr, betas=(0.5, 0.9))
+        opt_disc = torch.optim.Adam(self.loss.discriminator.parameters(),
+                                    lr=lr, betas=(0.5, 0.9))
+        return [opt_ae, opt_disc], []
+
+    def get_last_layer(self):
+        return self.decoder.conv_out.weight

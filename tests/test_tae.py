@@ -1,4 +1,4 @@
-from train_moviegen import TAE, TAEConfig
+from tae import TAE, TAEConfig
 
 
 def test_tae_weight_loading():
