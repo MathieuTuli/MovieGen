@@ -729,10 +729,14 @@ class DiagonalGaussianDistribution:
             return torch.Tensor([0.])
         else:
             if other is None:
-                return 0.5 * torch.sum(torch.pow(self.mean, 2)
-                                       + self.var - 1.0 - self.logvar,
+                mean = self.mean.flatten(0, 1)
+                var = self.var.flatten(0, 1)
+                logvar = self.logvar.flatten(0, 1)
+                return 0.5 * torch.sum(torch.pow(mean, 2)
+                                       + var - 1.0 - logvar,
                                        dim=[1, 2, 3])
             else:
+                raise NotImplementedError
                 return 0.5 * torch.sum(
                     torch.pow(self.mean - other.mean, 2) / other.var
                     + self.var / other.var - 1.0 - self.logvar + other.logvar,
@@ -1141,7 +1145,7 @@ class LPIPSWithDiscriminator(nn.Module):
         self.disc_factor = disc_factor
         self.discriminator_weight = disc_weight
         self.disc_conditional = disc_conditional
-        self.outlier_scaling_weight = outlier_loss_weight
+        self.outlier_loss_weight = outlier_loss_weight
         self.outlier_scaling_factor = outlier_scaling_factor
 
     def calculate_adaptive_weight(self, nll_loss, g_loss, last_layer=None):
@@ -1164,6 +1168,8 @@ class LPIPSWithDiscriminator(nn.Module):
     def forward(self, inputs, reconstructions, posteriors, optimizer_idx,
                 global_step, last_layer=None, cond=None, split="train",
                 weights=None):
+        inputs = inputs.flatten(0, 1)
+        reconstructions = reconstructions.flatten(0, 1)
         rec_loss = torch.abs(inputs.contiguous() -
                              reconstructions.contiguous())
         if self.perceptual_weight > 0:
@@ -1180,7 +1186,7 @@ class LPIPSWithDiscriminator(nn.Module):
         nll_loss = torch.sum(nll_loss) / nll_loss.shape[0]
         kl_loss = posteriors.kl()
         kl_loss = torch.sum(kl_loss) / kl_loss.shape[0]
-        B, T, C, H, W = posteriors.mean
+        B, T, C, H, W = posteriors.mean.shape
         X = posteriors.mean.view(B * T, C, H, W)
         outlier_loss = 0.
         for b in range(B):
@@ -1189,8 +1195,8 @@ class LPIPSWithDiscriminator(nn.Module):
                     outlier_loss += torch.max(
                             (X[b, :, i, j] - X.mean()).norm() -
                             (self.outlier_scaling_factor * X.std()).norm(),
-                            0.)
-        outlier_loss /= B * H * W
+                            torch.tensor([0.], device=inputs.device))
+        outlier_loss /= H * W
 
         # now the GAN part
         if optimizer_idx == 0:
@@ -1229,7 +1235,7 @@ class LPIPSWithDiscriminator(nn.Module):
                    "{}/d_weight".format(split): d_weight.detach(),
                    "{}/disc_factor".format(split): torch.tensor(disc_factor),
                    "{}/g_loss".format(split): g_loss.detach().mean(),
-                   "{}/outlier_loss".format(split): torch.tensor(outlier_loss),
+                   "{}/outlier_loss".format(split): outlier_loss.detach(),
                    }
             return loss, log
 
@@ -1392,12 +1398,16 @@ class TAE(nn.Module):
     def forward(self, inputs, split, optimizer_idx, step,
                 sample_posterior=True):
         # temporal accounting
-        posterior = self.encode(input)
+        posterior = self.encode(inputs)
         if sample_posterior:
             z = posterior.sample()
         else:
             z = posterior.mode()
         dec = self.decode(z)
+        Tprime = inputs.shape[1]
+        assert dec.shape[1] >= Tprime
+        limit = dec.shape[1] - Tprime
+        dec = dec[:, :-limit]
 
         loss, log_dict = self.loss(
                 inputs, dec, posterior, optimizer_idx,  # 1 for val

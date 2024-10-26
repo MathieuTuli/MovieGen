@@ -14,21 +14,25 @@ from tae import TAE, TAEConfig
 
 class DataLoader:
     def __init__(self, fname):
-        x = list()
         vidcap = cv2.VideoCapture(fname)
-        ret, frame = vidcap.read()
+        ret, x = vidcap.read()
+        x = x[None, :]
         while ret:
-            x.append(frame)
             ret, frame = vidcap.read()
-        self.x = torch.Tensor(x, dtype=torch.uint8)
+            if ret:
+                x = np.concatenate([x, frame[None, :]])
+        self.x = torch.Tensor(x).to(torch.float32) / 127.5 - 1.
+        self.x = torch.nn.functional.interpolate(
+                self.x.permute(0, 3, 1, 2), (32, 32))
         self.count = 0
 
     def next_batch(self):
         if self.count % 4 == 0:
-            id = random.randint(0, x.shape[0])
+            id = random.randint(0, self.x.shape[0])
             return self.x[None, None, id]
         else:
             return self.x[None, :]
+        self.count += 1
 
 
 """
@@ -86,7 +90,7 @@ parser.add_argument("--val-loss-every", type=int, default=0)
 parser.add_argument("--val-max-steps", type=int, default=20)
 parser.add_argument("--overfit-batch", default=1, type=int)
 # memory management
-parser.add_argument("--dtype", type=str, default="bfloat16")
+parser.add_argument("--dtype", type=str, default="float32")
 parser.add_argument("--compile", default=0, type=int)
 
 
@@ -115,6 +119,7 @@ if __name__ == "__main__":
     model = TAE(config)
     if args.compile:
         model = torch.compile(model)
+    model.to(device)
 
     train_loader = DataLoader("rickroll.gif")
     val_loader = DataLoader("rickroll.gif")
