@@ -4,7 +4,6 @@ Reference code for Movie Gen training and inference.
 References:
     # NOQA 1) https://ai.meta.com/static-resource/movie-gen-research-paper/?utm_source=twitter&utm_medium=organic_social&utm_content=thread&utm_campaign=moviegen
 """
-from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Tuple
 from pathlib import Path
@@ -26,6 +25,7 @@ import torch.nn as nn
 import numpy as np
 import torch
 
+from text_encoder import TextEncoder, TextEncoderConfig
 from tae import TAE, TAEConfig
 
 # NOQA TODO: dim issues for sure, need to test: particularly the cross attention I just plopped in there
@@ -264,7 +264,7 @@ class BidirectionalSelfAttention(nn.Module):
                 q, k, v, mask == 0 if T > 1 else None)
         else:
             # manual implementation of attention
-            # this materializes the large (T, T) matrix for all queries and keys
+            # this materializes the large (T,T) matrix for all queries and keys
             scores = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.hd))
             if mask is not None:
                 scores.masked_fill_(mask, torch.finfo(scores.dtype).min)
