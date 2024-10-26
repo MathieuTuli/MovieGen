@@ -1,4 +1,4 @@
-from typing import Union, Tuple, Callable, Set
+from typing import Union, Tuple, Callable, Set, Optional
 from collections import OrderedDict
 from dataclasses import dataclass
 from itertools import repeat
@@ -505,7 +505,7 @@ class CLIP(nn.Module):
         self.init_parameters()
 
     def from_pretrained(self, path: str, map_location="cpu"):
-        checkpoint = torch.load(checkpoint_path,
+        checkpoint = torch.load(path,
                                 weights_only=True,
                                 map_location=map_location)
         step, positions = -1, None
@@ -618,7 +618,7 @@ TextEncoder
 class TextEncoderConfig:
     version: str = "1.0"
     embed_dim: int = 6144
-    models: Set[str, str, str] = {"metaclip", "byt5", "ul2"}
+    models: Set[str] = ("metaclip", "byt5", "ul2")
 
     def __init__(self, **kwargs):
         for k, v in kwargs.items():
