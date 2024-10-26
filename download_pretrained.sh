@@ -7,24 +7,28 @@ mkdir pretrained-weights/metaclip
 
 # TAE
 cd pretrained-weights/tae
-wget https://ommer-lab.com/files/latent-diffusion/kl-f8.zip
-unzip kl-f8.zip
+if [ ! -f model.ckpt ]; then
+    wget https://ommer-lab.com/files/latent-diffusion/kl-f8.zip
+    unzip kl-f8.zip
+else
+    echo "tae kl-f8 model.ckpt exists, skipping..." 
+fi
 cd ../..
 
-# ul2
-#- cd pretrained-weights/tae
-#- wget ???
-#- unzip ???.zip
-#- cd ../..
+# for ul2 I use hugginface
+
 
 # byt5
-#- cd pretrained-weights/tae
+#- cd pretrained-weights/byt5
 #- wget ???
 #- unzip ???.zip
 #- cd ../..
 
 # metaclip
-#- cd pretrained-weights/tae
-#- wget ???
-#- unzip ???.zip
-#- cd ../..
+cd pretrained-weights/metaclip
+if [ ! -f G14_fullcc2.5b.pt ]; then
+    wget https://dl.fbaipublicfiles.com/MMPT/metaclip/G14_fullcc2.5b.pt
+else
+    echo "metaclip G14_fullcc2.5b.pt exists, skipping..." 
+fi
+cd ../..

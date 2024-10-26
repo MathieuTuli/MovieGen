@@ -446,55 +446,6 @@ models
 
 
 @dataclass
-class TextEncoderConfig:
-    version: str = "1.0"
-    embed_dim: int = 6144
-
-    def __init__(self, **kwargs):
-        for k, v in kwargs.items():
-            if hasattr(self, k):
-                setattr(self, k, v)
-
-
-class TextEncoder(nn.Module):
-    def __init__(self, config: TextEncoderConfig):
-        super().__init__()
-        self.config = config
-
-        # TODO: copy models
-        self.ul2 = nn.Sequential(OrderedDict([
-            ("encoder", ...),
-            ("proj", nn.Linear(4096, config.embed_dim, bias=False)),
-            ("ln", nn.LayerNorm(config.embed_dim)),
-        ]))
-        self.byt5 = nn.Sequential(OrderedDict([
-            ("encoder", ...),
-            ("proj", nn.Linear(1280, config.embed_dim, bias=False)),
-            ("ln", nn.LayerNorm(config.embed_dim)),
-        ]))
-        self.metaclip = nn.Sequential(OrderedDict([
-            ("encoder", ...),
-            ("proj", nn.Linear(1472, config.embed_dim, bias=False)),
-            ("ln", nn.LayerNorm(config.embed_dim)),
-        ]))
-
-    def from_pretrained(self, ul2_ckpt: Path, byt5_ckpt: Path,
-                        metaclip_ckpt: Path, tae_ckpt: Path):
-        self.ul2.encoder.load_state_dict(
-            torch.load(ul2_ckpt, map_location="cpu", weights_only=True))
-        self.byt5.encoder.load_state_dict(
-            torch.load(byt5_ckpt, map_location="cpu", weights_only=True))
-        self.metaclip_ckpt.encoder.load_state_dict(
-            torch.load(metaclip_ckpt, map_location="cpu", weights_only=True))
-
-    def forward(self, x) -> torch.Tensor:
-        ul2_emb = self.ul2(x)
-        byt5_emb = self.byt5(x)
-        ul2_emb = self.metaclip(x)
-        return torch.cat((ul2_emb, byt5_emb, ul2_emb))
-
-
-@dataclass
 class MovieGenConfig:
     version: str = "1.0"
     block_size: int = 8192
