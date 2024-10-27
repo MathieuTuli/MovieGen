@@ -6,6 +6,7 @@ from itertools import repeat
 from pathlib import Path
 import collections.abc
 import regex as re
+import gzip
 import ftfy
 import html
 import math
@@ -23,11 +24,6 @@ import torch
 MetaCLIP Tokenizer
 -------------------------------------------------------------------------------
 """
-
-
-@lru_cache()
-def default_bpe():
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "bpe_simple_vocab_16e6.txt.gz")
 
 
 @lru_cache()
@@ -79,7 +75,9 @@ def whitespace_clean(text):
 
 
 class SimpleTokenizer(object):
-    def __init__(self, bpe_path: str = default_bpe(), special_tokens=None):
+    def __init__(self,
+                 bpe_path: str = "pretrained-weights/metaclip/bpe_simple_vocab_16e6.txt.gz",  # noqa
+                 special_tokens=None):
         self.byte_encoder = bytes_to_unicode()
         self.byte_decoder = {v: k for k, v in self.byte_encoder.items()}
         merges = gzip.open(bpe_path).read().decode("utf-8").split('\n')
@@ -868,8 +866,8 @@ class TextEncoder(nn.Module):
             x = self.ul2_tokenizer(
                 bstring, return_tensors="pt", padding=True,
                 add_special_tokens=False)
-            x.input_ids = x.input_ids.to(device)
-            x.attention_mask = x.attention_mask.to(device)
+            x["input_ids"] = x["input_ids"].to(device)
+            x["attention_mask"] = x["attention_mask"].to(device)
             ret["ul2"] = x
         if self.metaclip is not None:
             x = self.metaclip_tokenizer(bstring).to(device)
@@ -878,8 +876,8 @@ class TextEncoder(nn.Module):
             x = self.byt5_tokenizer(
                 bstring, return_tensors="pt", padding=True,
                 add_special_tokens=False)
-            x.input_ids = x.input_ids.to(device)
-            x.attention_mask = x.attention_mask.to(device)
+            x["input_ids"] = x["input_ids"].to(device)
+            x["attention_mask"] = x["attention_mask"].to(device)
             ret["byt5"] = x
         return ret
 

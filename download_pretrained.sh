@@ -24,11 +24,15 @@ python -c "from transformers import T5EncoderModel; T5EncoderModel.from_pretrain
 python -c "from transformers import AutoTokenizer; AutoTokenizer.from_pretrained('google/byt5-small')"
 
 # metaclip
-python -c "from transformers import AutoTokenizer; AutoTokenizer.from_pretrained('facebook/metaclip-b16-fullcc2.5b')"
 cd pretrained-weights/metaclip
 if [ ! -f G14_fullcc2.5b.pt ]; then
     wget https://dl.fbaipublicfiles.com/MMPT/metaclip/G14_fullcc2.5b.pt
 else
     echo "metaclip G14_fullcc2.5b.pt exists, skipping..." 
+fi
+if [ ! -f bpe_simple_vocab_16e6.txt.gz ]; then
+    wget https://github.com/openai/CLIP/raw/refs/heads/main/clip/bpe_simple_vocab_16e6.txt.gz
+else
+    echo "metaclip bpe_simple_vocab_16e6.txt.gz exists, skipping..." 
 fi
 cd ../..
