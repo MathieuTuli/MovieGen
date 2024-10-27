@@ -860,6 +860,7 @@ class TextEncoder(nn.Module):
                 ("ln", nn.LayerNorm(config.embed_dim)),
             ]))
 
+    @torch.no_grad()
     def tokenize(self, bstring: str, device: str = "cpu"):
         ret = dict()
         if self.ul2 is not None:
@@ -884,6 +885,7 @@ class TextEncoder(nn.Module):
     def from_pretrained(self, metaclip_ckpt: Path):
         self.metaclip_encoder.from_pretrained(metaclip_ckpt)
 
+    @torch.no_grad()
     def forward(self, tokens: Dict[str, torch.Tensor]) -> torch.Tensor:
         # REVISIT: does order matter here?
         device, dtype = (list(tokens.values())[0].input_ids.device,
