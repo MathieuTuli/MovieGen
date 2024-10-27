@@ -945,7 +945,10 @@ class NetLinLayer(nn.Module):
 class vgg16(torch.nn.Module):
     def __init__(self, requires_grad=False, pretrained=True):
         super(vgg16, self).__init__()
-        vgg_pretrained_features = models.vgg16(pretrained=pretrained).features
+        # REVISIT: weights here idk - updated api
+        vgg_pretrained_features = models.vgg16(
+                weights=models.VGG16_Weights.IMAGENET1K_V1  # pretrained
+                ).features
         self.slice1 = torch.nn.Sequential()
         self.slice2 = torch.nn.Sequential()
         self.slice3 = torch.nn.Sequential()
@@ -1057,8 +1060,8 @@ class LPIPS(nn.Module):
     def load_from_pretrained(self, name="vgg_lpips"):
         ckpt = get_ckpt_path(
                 name, "pretrained-weights/taming/modules/autoencoder/lpips")
-        self.load_state_dict(torch.load(
-            ckpt, map_location=torch.device("cpu")), strict=False)
+        self.load_state_dict(torch.load(ckpt, map_location=torch.device("cpu"),
+                                        weights_only=True), strict=False)
         print("loaded pretrained LPIPS loss from {}".format(ckpt))
 
     @classmethod
@@ -1067,8 +1070,8 @@ class LPIPS(nn.Module):
             raise NotImplementedError
         model = cls()
         ckpt = get_ckpt_path(name)
-        model.load_state_dict(torch.load(
-            ckpt, map_location=torch.device("cpu")), strict=False)
+        model.load_state_dict(torch.load(ckpt, map_location=torch.device("cpu"),
+                                         weights_only=True, ), strict=False)
         return model
 
     def forward(self, input, target):
@@ -1342,7 +1345,8 @@ class TAE(nn.Module):
     def from_pretrained(self, ckpt: Path,
                         ignore_keys: List[str] = None,):
         ignore_keys = ignore_keys or list()
-        sd = torch.load(ckpt, map_location="cpu")["state_dict"]
+        sd = torch.load(ckpt, map_location="cpu",
+                        weights_only=False)["state_dict"]
         keys = list(sd.keys())
         for k in keys:
             for ik in ignore_keys:

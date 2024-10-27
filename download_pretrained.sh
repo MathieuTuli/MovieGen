@@ -16,15 +16,15 @@ fi
 cd ../..
 
 # for ul2 I use hugginface
+python -c "from transformers import T5EncoderModel; T5EncoderModel.from_pretrained('google/ul2')"
+python -c "from transformers import AutoTokenizer; AutoTokenizer.from_pretrained('google/ul2')"
 
-
-# byt5
-#- cd pretrained-weights/byt5
-#- wget ???
-#- unzip ???.zip
-#- cd ../..
+# for byt5 I use hugginface
+python -c "from transformers import T5EncoderModel; T5EncoderModel.from_pretrained('google/byt5-small')"
+python -c "from transformers import AutoTokenizer; AutoTokenizer.from_pretrained('google/byt5-small')"
 
 # metaclip
+python -c "from transformers import AutoTokenizer; AutoTokenizer.from_pretrained('facebook/metaclip-b16-fullcc2.5b')"
 cd pretrained-weights/metaclip
 if [ ! -f G14_fullcc2.5b.pt ]; then
     wget https://dl.fbaipublicfiles.com/MMPT/metaclip/G14_fullcc2.5b.pt

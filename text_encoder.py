@@ -1,4 +1,4 @@
-from typing import Union, Tuple, Callable, Set, Optional
+from typing import Union, Tuple, Callable, Set, Optional, Dict
 from collections import OrderedDict
 from dataclasses import dataclass
 from itertools import repeat
@@ -459,6 +459,7 @@ class CLIP(nn.Module):
         # OpenAI models are pretrained w/ QuickGELU
         act_layer = QuickGELU if quick_gelu else nn.GELU
 
+        self.visual = None
         if vision_cfg is not None and \
                 isinstance(vision_cfg.layers, (tuple, list)):
             vision_heads = vision_cfg.width * 32 // vision_cfg.head_width
@@ -517,12 +518,11 @@ class CLIP(nn.Module):
                 sd = {k[len('module.'):]: v for k, v in sd.items()}
             return sd
 
-        keys = list(sd.keys())
+        state_dict = unwrap_state_dict(checkpoint["state_dict"])
+        keys = list(state_dict.keys())
         for k in keys:
             if k.startswith("visual."):
-                del sd[k]
-
-        state_dict = unwrap_state_dict(checkpoint["state_dict"])
+                del state_dict[k]
         resize_pos_embed(state_dict, self)
         self.load_state_dict(state_dict, strict=True)
         return step, positions
@@ -588,7 +588,7 @@ class CLIP(nn.Module):
 
         return x
 
-    def forward(self, image, text, clamp_logit_scale_to=None):
+    def forward(self, text, image, clamp_logit_scale_to=None):
         if image is not None:
             image_features = self.encode_image(image)
             image_features = torch.nn.functional.normalize(
@@ -614,6 +614,13 @@ TextEncoder
 """
 
 
+def mean_pooling(last_hidden_state, attention_mask):
+    non_pad_tokens = attention_mask.sum(1)
+    sum_embeddings = torch.sum(
+        attention_mask.unsqueeze(-1) * last_hidden_state, 1)
+    return sum_embeddings/non_pad_tokens.unsqueeze(-1)
+
+
 @dataclass
 class TextEncoderConfig:
     version: str = "1.0"
@@ -631,41 +638,84 @@ class TextEncoder(nn.Module):
         super().__init__()
         self.config = config
 
+        assert all([x in {"ul2", "byt5", "metaclip"} for x in config.models])
+        self.ul2, self.byt5, self.metaclip = None, None, None
         if "ul2" in config.models:
             self.ul2 = T5EncoderModel.from_pretrained("google/ul2")
             self.ul2_tokenizer = AutoTokenizer.from_pretrained("google/ul2")
             self.ul2_proj = nn.Sequential(OrderedDict([
                 ("proj", nn.Linear(4096, config.embed_dim, bias=False)),
                 ("ln", nn.LayerNorm(config.embed_dim)),
-                ]))
+            ]))
         if "byt5" in config.models:
             self.byt5 = T5EncoderModel.from_pretrained("google/byt5-small")
-            self.byt5_tokenizer = AutoTokenizer.from_pretrained("google/byt5-small")
+            self.byt5_tokenizer = AutoTokenizer.from_pretrained(
+                "google/byt5-small")
             self.byt5_proj = nn.Sequential(OrderedDict([
-                ("proj", nn.Linear(1280, config.embed_dim, bias=False)),
+                ("proj", nn.Linear(1472, config.embed_dim, bias=False)),
                 ("ln", nn.LayerNorm(config.embed_dim)),
-                ]))
+            ]))
 
         if "metaclip" in config.models:
             self.metaclip = CLIP(embed_dim=1280,
                                  vision_cfg=None,
                                  text_cfg=CLIPTextCfg(),
                                  quick_gelu=True)
+            self.metaclip_tokenizer = AutoTokenizer.from_pretrained("facebook/metaclip-b16-fullcc2.5b")  # noqa
+
             self.metaclip_proj = nn.Sequential(OrderedDict([
-                ("proj", nn.Linear(1472, config.embed_dim, bias=False)),
+                ("proj", nn.Linear(1280, config.embed_dim, bias=False)),
                 ("ln", nn.LayerNorm(config.embed_dim)),
             ]))
+
+    def tokenize(self, bstring: str, device: str = "cpu"):
+        ret = dict()
+        if self.ul2 is not None:
+            x = self.ul2_tokenizer(
+                bstring, return_tensors="pt", padding=True,
+                add_special_tokens=False)
+            x.input_ids = x.input_ids.to(device)
+            x.attention_mask = x.attention_mask.to(device)
+            ret["ul2"] = x
+        if self.metaclip is not None:
+            x = self.metaclip_tokenizer(
+                bstring, return_tensors="pt", padding=True,
+                add_special_tokens=False)
+            x.input_ids = x.input_ids.to(device)
+            x.attention_mask = x.attention_mask.to(device)
+            import open_clip
+            ret["metaclip"] = open_clip.tokenize(bstring)
+        if self.byt5 is not None:
+            x = self.byt5_tokenizer(
+                bstring, return_tensors="pt", padding=True,
+                add_special_tokens=False)
+            x.input_ids = x.input_ids.to(device)
+            x.attention_mask = x.attention_mask.to(device)
+            ret["byt5"] = x
+        return ret
 
     def from_pretrained(self, metaclip_ckpt: Path):
         self.metaclip_encoder.from_pretrained(metaclip_ckpt)
 
-    def forward(self, x) -> torch.Tensor:
+    def forward(self, tokens: Dict[str, torch.Tensor]) -> torch.Tensor:
         # REVISIT: does order matter here?
-        emb = torch.empty(0, device=x.device, dtype=x.dtype)
-        if self.ul2 is not None:
-            emb = torch.cat((emb, self.ul2_proj(self.ul2(x))))
-        if self.metaclip is not None:
-            emb = torch.cat((emb, self.metaclip_proj(self.metaclip(x))))
-        if self.byt5 is not None:
-            emb = torch.cat((emb, self.byt5_proj(self.byt5(x))))
+        device, dtype = (list(tokens.values())[0].input_ids.device,
+                         list(tokens.values())[0].input_ids.dtype)
+        emb = torch.empty(0, device=device, dtype=dtype)
+        if "ul2" in tokens:
+            enc = self.ul2(**tokens["ul2"]).last_hidden_state
+            enc = mean_pooling(enc, tokens["ul2"].attention_mask)
+            emb = torch.cat((emb, self.ul2_proj(enc)))
+        if "metaclip" in tokens:
+            enc = self.metaclip.encode_text(tokens["metaclip"])
+            # REVISIT: clip norm?
+            # enc /= enc.norm(dim=-1, keepdim=True)
+            # enc = mean_pooling(enc, tokens["metaclip"].attention_mask)
+            # enc = torch.nn.functional.normalize(enc, dim=-1).mean(dim=0)
+            # enc /= enc.norm()
+            emb = torch.cat((emb, self.metaclip_proj(enc)))
+        if "byt5" in tokens:
+            enc = self.byt5(**tokens["byt5"]).last_hidden_state
+            enc = mean_pooling(enc, tokens["byt5"].attention_mask)
+            emb = torch.cat((emb, self.byt5_proj(enc)))
         return emb
