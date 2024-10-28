@@ -1342,8 +1342,7 @@ class TAE(nn.Module):
                                            kl_weight=0.000001,
                                            disc_weight=0.5)
 
-    def from_pretrained(self, ckpt: Path,
-                        ignore_keys: List[str] = None,):
+    def from_pretrained(self, ckpt: Path, ignore_keys: List[str] = None,):
         ignore_keys = ignore_keys or list()
         sd = torch.load(ckpt, map_location="cpu",
                         weights_only=False)["state_dict"]

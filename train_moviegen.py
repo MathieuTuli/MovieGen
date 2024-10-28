@@ -4,8 +4,8 @@ Reference code for Movie Gen training and inference.
 References:
     # NOQA 1) https://ai.meta.com/static-resource/movie-gen-research-paper/?utm_source=twitter&utm_medium=organic_social&utm_content=thread&utm_campaign=moviegen
 """
+from typing import Tuple, Optional
 from dataclasses import dataclass
-from typing import Tuple
 from pathlib import Path
 
 import argparse
@@ -35,8 +35,7 @@ from tae import TAE, TAEConfig
 # NOQA TODO: dataloader also empty, fill that
 # NOQA TODO: DDP is copied naively from llm.c - confirm
 # NOQA TODO: shard text/vae probably (other parallels from paper maybe?)
-# NOQA TODO: refactor to enable pre-train tae
-#               - or keep in same file? idk
+# NOQA DONE: refactor to enable pre-train tae - or keep in same file? idk
 
 """
 -------------------------------------------------------------------------------
@@ -421,14 +420,17 @@ class MLP(nn.Module):
 
 class Block(nn.Module):
     def __init__(self, config):
+        # REVISIT: where does the adaptive layer norm for t go?
         super().__init__()
         self.ln_1 = RMSNorm(config.n_embd, config.norm_eps)
+        # REVISIT: Check this bi self attention naively
         self.attn = BidirectionalSelfAttention(config)
         self.ln_2 = RMSNorm(config.n_embd, config.norm_eps)
-        # TODO: Add cross attention here for prompt embd
+        # REVISIT: Check this cross attention added naively
         self.bd_cross_attn = BidirectionalCrossAttention(
             dim=config.n_embd, heads=config.n_head,
             dim_head=config.dim_head)
+        # REVISIT: should be another norm here
         self.mlp = MLP(config)
 
     def forward(self, x, ctx, freqs_cis=None, start_pos=None, mask=None):
@@ -504,10 +506,12 @@ class MovieGen(nn.Module):
 
     @classmethod
     def initialize_auxiliary_models(self,
-                                    ul2_ckpt: Path, byt5_ckpt: Path,
-                                    metaclip_ckpt: Path, tae_ckpt: Path):
-        self.text_encoder.from_pretrained(ul2_ckpt, byt5_ckpt, metaclip_ckpt)
-        self.tae.from_pretrained(tae_ckpt)
+                                    metaclip_ckpt: Optional[Path],
+                                    tae_ckpt: Optional[Path]):
+        if metaclip_ckpt is not None:
+            self.text_encoder.from_pretrained(metaclip_ckpt)
+        if tae_ckpt is not None:
+            self.tae.from_pretrained(tae_ckpt)
 
     @classmethod
     def from_pretrained(self,
@@ -572,7 +576,12 @@ class MovieGen(nn.Module):
         _, t = x.size()  # REVISIT: from llama3, needs to be updated
         ctx = self.text_encoder(prompt)
         x = self.tae.encode(x)
-        x = self.patchifier(x).flatten()
+        # REVISIT: does this need permuting?
+        # x = x.permute(0, 2, 1, 3, 4)
+        x = self.patchifier(x)
+        # REVISIT:
+        # pos = self.pos_embd(x)
+        x = torch.flatten(x, start_dim=1)
 
         freqs_cis = self.freqs_cis[start_pos:start_pos+t]
         for i, block in enumerate(self.transformer.h):
@@ -598,16 +607,6 @@ class MovieGen(nn.Module):
             logits = None
 
         return logits, loss
-
-
-# TODO: do this eventually, not needed though
-class SpatialUpsampler(nn.Module):
-    def forward(self, x) -> torch.Tensor:
-        # x = blerp(x)
-        # x = encoder(x)
-        # x = transformer(x + noise)
-        # x = decoder(x)
-        return x
 
 
 """
