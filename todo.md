@@ -1,6 +1,15 @@
 # general
 - [ ] fps considerations?
-
-# tae
-- [x] outlier penalty loss
-- [ ] efficient inference using temporal tiling
+    - tbh I forget what this means
+- [ ] TAE pipeline
+    - [ ] validate training working
+    - [ ] DDP loader
+    - [ ] build inference pipeline
+    - [ ] validate outlier penalty loss which handles spots
+    - [ ] efficient inference using temporal tiling
+- [ ] MovieGen pipeline
+    - [ ] build training pipeline
+    - [ ] DDP loader
+    - [ ] build inference pipeline
+- [ ] Model sharding
+    - [ ] implement techniques from paper
