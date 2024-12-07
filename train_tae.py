@@ -16,11 +16,12 @@ class DataLoader:
     def __init__(self, fname):
         vidcap = cv2.VideoCapture(fname)
         ret, x = vidcap.read()
-        x = x[None, :]
-        while ret:
-            ret, frame = vidcap.read()
-            if ret:
-                x = np.concatenate([x, frame[None, :]])
+        # x = x[None, :]
+        # while ret:
+        #     ret, frame = vidcap.read()
+        #     if ret:
+        #         x = np.concatenate([x, frame[None, :]])
+        x = cv2.imread("test.JPEG")[None, :]
         self.x = torch.Tensor(x).to(torch.float32) / 127.5 - 1.
         self.x = torch.nn.functional.interpolate(
                 self.x.permute(0, 3, 1, 2), (32, 32))
@@ -28,8 +29,8 @@ class DataLoader:
 
     def next_batch(self):
         if self.count % 4 == 0:
-            id = random.randint(0, self.x.shape[0])
-            return self.x[None, None, id]
+            id = random.randint(0, self.x.shape[0] - 1)
+            return self.x[id][None, None, :]
         else:
             return self.x[None, :]
         self.count += 1
@@ -77,7 +78,7 @@ parser = argparse.ArgumentParser()
 # yes you can use parser types like this
 parser.add_argument("--ckpt", type=asspath, required=False)
 parser.add_argument("--output-dir", type=mkpath, default="")
-parser.add_argument("--tae-ckpt", type=asspath, required=False)
+# parser.add_argument("--tae-ckpt", type=asspath, required=False)
 # optimization
 parser.add_argument("--lr", type=float, default=1e-5)
 parser.add_argument("--weight-decay", type=float, default=0.0)
@@ -117,6 +118,14 @@ if __name__ == "__main__":
 
     config = TAEConfig()
     model = TAE(config)
+    if args.ckpt:
+        model.from_pretrained(args.ckpt,
+                              ignore_keys=[
+                                  "encoder.conv_out",
+                                  "decoder.conv_in",
+                                  "quant_conv",
+                                  "post_quant_conv",
+                                  ])
     if args.compile:
         model = torch.compile(model)
     model.to(device)
