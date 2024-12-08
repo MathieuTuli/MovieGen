@@ -4,8 +4,9 @@
     - wait, from paper:
     - *"Controlling the FPS. We use FPS conditioning to control the length of the generated videos by pre-appending the sampling FPS value of each training video to the input text prompt (e.g., “FPS-16”). During pre-training, we sample video clips at their original FPS with minimum of 16 FPS. In finetuning, we sample clips at two fixed FPS values of 16 and 24."*
 - TAE pipeline
-    - [ ] validate training working
+    - [x] validate training working
     - [ ] DDP loader
+    - [ ] clean up training script logging and args
     - [ ] build inference pipeline
     - [ ] validate outlier penalty loss which handles spots
     - [ ] efficient inference using temporal tiling
