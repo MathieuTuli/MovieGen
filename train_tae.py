@@ -41,7 +41,8 @@ class DataLoader:
             id = random.randint(0, self.x.shape[0] - 1)
             return self.x[id][None, None, :]
         else:
-            return self.x[None, :]
+            id = random.randint(0, self.x.shape[0] - 1)
+            return self.x[None, id:id+8]
 
 
 """

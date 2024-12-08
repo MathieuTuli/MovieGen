@@ -1414,8 +1414,8 @@ class TAE(nn.Module):
         dec = self.decode(z)
         Tprime = inputs.shape[1]
         assert dec.shape[1] >= Tprime
-        limit = dec.shape[1] - Tprime
-        dec = dec[:, :-limit]
+        # limit = dec.shape[1] - Tprime
+        dec = dec[:, :Tprime]
 
         loss, log_dict = self.loss(
                 inputs, dec, posterior, optimizer_idx,  # 1 for val
