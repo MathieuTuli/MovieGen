@@ -5,7 +5,10 @@ import random
 import time
 import os
 
+from PIL import Image
+
 import numpy as np
+import torchvision
 import torch
 import cv2
 
@@ -13,18 +16,23 @@ from tae import TAE, TAEConfig
 
 
 class DataLoader:
-    def __init__(self, fname):
+    def __init__(self, fname, size: int = 128):
         vidcap = cv2.VideoCapture(fname)
         ret, x = vidcap.read()
-        # x = x[None, :]
-        # while ret:
-        #     ret, frame = vidcap.read()
-        #     if ret:
-        #         x = np.concatenate([x, frame[None, :]])
-        x = cv2.imread("test.JPEG")[None, :]
-        self.x = torch.Tensor(x).to(torch.float32) / 127.5 - 1.
-        self.x = torch.nn.functional.interpolate(
-                self.x.permute(0, 3, 1, 2), (32, 32))
+        x = Image.fromarray(cv2.cvtColor(x, cv2.COLOR_BGR2RGB))
+        transforms = torchvision.transforms.Compose([
+            torchvision.transforms.Resize(size),
+            torchvision.transforms.PILToTensor(),
+            torchvision.transforms.ConvertImageDtype(torch.float32),
+            torchvision.transforms.Normalize([0.5], [0.5]),
+            ])
+        x = transforms(x)[None, :]
+        while ret:
+            ret, frame = vidcap.read()
+            if ret:
+                frame = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                x = torch.cat([x, transforms(frame)[None, :]])
+        self.x = x
         self.count = 0
 
     def next_batch(self):
@@ -78,6 +86,7 @@ parser = argparse.ArgumentParser()
 # yes you can use parser types like this
 parser.add_argument("--ckpt", type=asspath, required=False)
 parser.add_argument("--output-dir", type=mkpath, default="")
+parser.add_argument("--ckpt-from-ldm", type=int, default=1, choices=[0, 1])
 # parser.add_argument("--tae-ckpt", type=asspath, required=False)
 # optimization
 parser.add_argument("--lr", type=float, default=1e-5)
@@ -119,13 +128,17 @@ if __name__ == "__main__":
     config = TAEConfig()
     model = TAE(config)
     if args.ckpt:
-        model.from_pretrained(args.ckpt,
-                              ignore_keys=[
-                                  "encoder.conv_out",
-                                  "decoder.conv_in",
-                                  "quant_conv",
-                                  "post_quant_conv",
-                                  ])
+        ignore_keys = list()
+        if args.ckpt_from_ldm:
+            ignore_keys = [
+                    "encoder.conv_out",
+                    "decoder.conv_in",
+                    "quant_conv",
+                    "post_quant_conv",
+                    ]
+
+        model.from_pretrained(args.ckpt, ignore_keys=ignore_keys)
+
     if args.compile:
         model = torch.compile(model)
     model.to(device)
@@ -139,23 +152,29 @@ if __name__ == "__main__":
 
     torch.cuda.reset_peak_memory_stats()
     timings = list()
+    print("Starting training...")
     for step in range(args.num_iterations + 1):
         t0 = time.time()
         last_step = (step == args.num_iterations - 1)
 
         # once in a while evaluate the validation dataset
-        if (args.val_loss_every > 0
-                and (step % args.val_loss_every == 0 or last_step)) \
-                and (val_loader is not None):
+        if ((args.val_loss_every > 0 and step % args.val_loss_every == 0) or last_step) and (val_loader is not None):  # noqa
             model.eval()
-            val_loader.reset()
             with torch.no_grad():
                 val_loss = 0.
-                for _ in range(args.val_max_steps):
+                for vali in range(args.val_max_steps):
                     x = val_loader.next_batch()
                     x = x.to(device)
-                    _, _, loss = model(x, "val", 1, step)
+                    dec, _, loss = model(x, "val", 1, step)
                     val_loss += loss.item()
+                    for b in range(dec.shape[0]):
+                        for t in range(dec.shape[1]):
+                            fn = args.output_dir / f"val_dec_{vali}.png"
+                            torchvision.transforms.ToPILImage()(
+                                    (dec[b, t] + 1) * 0.5).save(fn)
+                            fn = args.output_dir / f"val_x_{vali}.png"
+                            torchvision.transforms.ToPILImage()(
+                                    (x[b, t] + 1) * 0.5).save(fn)
                 val_loss /= args.val_max_steps
             # log to console and to file
             print0(f"val loss {val_loss}")
@@ -216,5 +235,8 @@ if __name__ == "__main__":
     timings = timings[-20:]
     print0(f"final {len(timings)} iters avg: {np.mean(timings)*1000:.3f}ms")
     print0(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")  # NOQA
+
+    torch.save({"state_dict": model.state_dict()},
+               args.output_dir / "tae.ckpt")
 
     # -------------------------------------------------------------------------
