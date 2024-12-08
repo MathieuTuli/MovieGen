@@ -6,7 +6,7 @@
 - TAE pipeline
     - [x] validate training working
     - [ ] DDP loader
-    - [ ] clean up training script logging and args
+    - [ ] clean up training script logging and args and training resume (or continuation)
     - [ ] build inference pipeline
     - [ ] validate outlier penalty loss which handles spots
     - [ ] efficient inference using temporal tiling

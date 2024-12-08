@@ -1293,6 +1293,9 @@ class TAEConfig:
     dropout: float = 0.0
     scale_factor: float = 1.
     strict: bool = False
+    loss_disc_start: int = 5001
+    loss_kl_weight: float = 1e-6
+    loss_disc_weight: float = 0.5
 
     def __init__(self, **kwargs):
         for k, v in kwargs.items():
@@ -1338,9 +1341,10 @@ class TAE(nn.Module):
             config.embed_dim, config.z_channels, 1)
         self.embed_dim = config.embed_dim
         self.scale_factor = config.scale_factor
-        self.loss = LPIPSWithDiscriminator(disc_start=50001,
-                                           kl_weight=0.000001,
-                                           disc_weight=0.5)
+        self.loss = LPIPSWithDiscriminator(
+                disc_start=config.loss_disc_start,
+                kl_weight=config.loss_kl_weight,
+                disc_weight=config.loss_disc_weight)
 
     def from_pretrained(self, ckpt: Path, ignore_keys: List[str] = None,):
         ignore_keys = ignore_keys or list()
@@ -1360,7 +1364,7 @@ class TAE(nn.Module):
 
         temp_sd = self.state_dict()
         for k in temp_sd:
-            if "temp_" in k:
+            if "temp_" in k and k not in sd:
                 sd[k] = temp_sd[k]
 
         self.load_state_dict(sd, strict=self.strict)

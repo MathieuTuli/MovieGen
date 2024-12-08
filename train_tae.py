@@ -33,15 +33,15 @@ class DataLoader:
                 frame = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
                 x = torch.cat([x, transforms(frame)[None, :]])
         self.x = x
-        self.count = 0
+        self.count = -1
 
     def next_batch(self):
+        self.count += 1
         if self.count % 4 == 0:
             id = random.randint(0, self.x.shape[0] - 1)
             return self.x[id][None, None, :]
         else:
             return self.x[None, :]
-        self.count += 1
 
 
 """
@@ -99,6 +99,7 @@ parser.add_argument("--num-iterations", type=int, default=10)
 parser.add_argument("--val-loss-every", type=int, default=0)
 parser.add_argument("--val-max-steps", type=int, default=20)
 parser.add_argument("--overfit-batch", default=1, type=int)
+parser.add_argument("--inference-only", default=0, type=int, choices=[0, 1])
 # memory management
 parser.add_argument("--dtype", type=str, default="float32")
 parser.add_argument("--compile", default=0, type=int)
@@ -152,13 +153,16 @@ if __name__ == "__main__":
 
     torch.cuda.reset_peak_memory_stats()
     timings = list()
-    print("Starting training...")
+    if args.inference_only:
+        print("Starting inference only.")
+    else:
+        print("Starting training.")
     for step in range(args.num_iterations + 1):
         t0 = time.time()
         last_step = (step == args.num_iterations - 1)
 
         # once in a while evaluate the validation dataset
-        if ((args.val_loss_every > 0 and step % args.val_loss_every == 0) or last_step) and (val_loader is not None):  # noqa
+        if ((args.val_loss_every > 0 and step % args.val_loss_every == 0) or last_step or args.inference_only) and (val_loader is not None):  # noqa
             model.eval()
             with torch.no_grad():
                 val_loss = 0.
@@ -169,10 +173,10 @@ if __name__ == "__main__":
                     val_loss += loss.item()
                     for b in range(dec.shape[0]):
                         for t in range(dec.shape[1]):
-                            fn = args.output_dir / f"val_dec_{vali}.png"
+                            fn = args.output_dir / f"val_dec_{vali}_{b}_{t}.png"
                             torchvision.transforms.ToPILImage()(
                                     (dec[b, t] + 1) * 0.5).save(fn)
-                            fn = args.output_dir / f"val_x_{vali}.png"
+                            fn = args.output_dir / f"val_x_{vali}_{b}_{t}.png"
                             torchvision.transforms.ToPILImage()(
                                     (x[b, t] + 1) * 0.5).save(fn)
                 val_loss /= args.val_max_steps
@@ -182,7 +186,7 @@ if __name__ == "__main__":
                 with open(logfile, "a") as f:
                     f.write("s:%d val_loss:%f\n" % (step, val_loss))
 
-        if last_step:
+        if last_step or args.inference_only:
             break
 
         model.train()
