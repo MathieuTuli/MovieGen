@@ -16,7 +16,7 @@ from tae import TAE, TAEConfig
 
 
 class DataLoader:
-    def __init__(self, fname, size: int = 128):
+    def __init__(self, fname, size: int = 64):
         vidcap = cv2.VideoCapture(fname)
         ret, x = vidcap.read()
         x = Image.fromarray(cv2.cvtColor(x, cv2.COLOR_BGR2RGB))
@@ -42,7 +42,7 @@ class DataLoader:
             return self.x[id][None, None, :]
         else:
             id = random.randint(0, self.x.shape[0] - 1)
-            return self.x[None, id:id+8]
+            return self.x[None, id:id+32]
 
 
 """
