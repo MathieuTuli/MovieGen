@@ -947,8 +947,8 @@ class vgg16(torch.nn.Module):
         super(vgg16, self).__init__()
         # REVISIT: weights here idk - updated api
         vgg_pretrained_features = models.vgg16(
-                weights=models.VGG16_Weights.IMAGENET1K_V1  # pretrained
-                ).features
+            weights=models.VGG16_Weights.IMAGENET1K_V1  # pretrained
+        ).features
         self.slice1 = torch.nn.Sequential()
         self.slice2 = torch.nn.Sequential()
         self.slice3 = torch.nn.Sequential()
@@ -1059,7 +1059,7 @@ class LPIPS(nn.Module):
 
     def load_from_pretrained(self, name="vgg_lpips"):
         ckpt = get_ckpt_path(
-                name, "pretrained-weights/taming/modules/autoencoder/lpips")
+            name, "pretrained-weights/taming/modules/autoencoder/lpips")
         self.load_state_dict(torch.load(ckpt, map_location=torch.device("cpu"),
                                         weights_only=True), strict=False)
         print("loaded pretrained LPIPS loss from {}".format(ckpt))
@@ -1127,7 +1127,7 @@ class LPIPSWithDiscriminator(nn.Module):
                  perceptual_weight=1.0, use_actnorm=False,
                  disc_conditional=False, disc_loss="hinge",
                  outlier_scaling_factor: int = 3,
-                 outlier_loss_weight: float = 1e-5):
+                 outlier_loss_weight: float = 1e5):
 
         super().__init__()
         assert disc_loss in ["hinge", "vanilla"]
@@ -1198,9 +1198,10 @@ class LPIPSWithDiscriminator(nn.Module):
             for i in range(H):
                 for j in range(W):
                     outlier_loss += torch.max(
-                            (X[b, :, i, j] - X.mean()).norm() -
-                            (self.outlier_scaling_factor * X.std()).norm(),
-                            torch.tensor([0.], device=inputs.device))
+                        (X[b, :, i, j] - X.mean()).norm() -
+                        (self.outlier_scaling_factor * X.std()).norm(),
+                        torch.zeros_like(X[b, :, i, j],
+                                         device=inputs.device))
         outlier_loss /= H * W
 
         # now the GAN part
@@ -1343,9 +1344,9 @@ class TAE(nn.Module):
         self.embed_dim = config.embed_dim
         self.scale_factor = config.scale_factor
         self.loss = LPIPSWithDiscriminator(
-                disc_start=config.loss_disc_start,
-                kl_weight=config.loss_kl_weight,
-                disc_weight=config.loss_disc_weight)
+            disc_start=config.loss_disc_start,
+            kl_weight=config.loss_kl_weight,
+            disc_weight=config.loss_disc_weight)
 
     def from_pretrained(self, ckpt: Path, ignore_keys: List[str] = None,):
         ignore_keys = ignore_keys or list()
@@ -1419,9 +1420,9 @@ class TAE(nn.Module):
         dec = dec[:, :Tprime]
 
         loss, log_dict = self.loss(
-                inputs, dec, posterior, optimizer_idx,  # 1 for val
-                step, last_layer=self.last_layer, split="train")
-        return dec, posterior, loss
+            inputs, dec, posterior, optimizer_idx,  # 1 for val
+            step, last_layer=self.last_layer, split="train")
+        return dec, posterior, loss, log_dict
 
     def configure_optimizers(
             self, lr: float, weight_decay: float,

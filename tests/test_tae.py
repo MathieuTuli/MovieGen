@@ -72,9 +72,9 @@ def test_tae_forward():
     tae = TAE(tae_config)
     tae.to(device)
     x = torch.zeros((3, 1, 3, 32, 32), device=device)  # [b, seq, c, w, h]
-    dec, post, _ = tae(x, "val", 0, 0)
+    dec, post, _, _ = tae(x, "val", 0, 0)
     assert dec.shape == x.shape
     x = torch.zeros((3, 11, 3, 32, 32), device=device)  # [b, seq, c, w, h]
-    dec, post, _ = tae(x, "val", 0, 0)
+    dec, post, _, _ = tae(x, "val", 0, 0)
     assert dec.shape == x.shape
     del tae, x

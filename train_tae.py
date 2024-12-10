@@ -101,6 +101,7 @@ parser.add_argument("--val-loss-every", type=int, default=0)
 parser.add_argument("--val-max-steps", type=int, default=20)
 parser.add_argument("--overfit-batch", default=1, type=int)
 parser.add_argument("--inference-only", default=0, type=int, choices=[0, 1])
+parser.add_argument("--verbose-loss", default=0, type=int, choices=[0, 1])
 # memory management
 parser.add_argument("--dtype", type=str, default="float32")
 parser.add_argument("--compile", default=0, type=int)
@@ -170,7 +171,7 @@ if __name__ == "__main__":
                 for vali in range(args.val_max_steps):
                     x = val_loader.next_batch()
                     x = x.to(device)
-                    dec, _, loss = model(x, "val", 1, step)
+                    dec, _, loss, loss_dict = model(x, "val", 1, step)
                     val_loss += loss.item()
                     for b in range(dec.shape[0]):
                         for t in range(dec.shape[1]):
@@ -198,7 +199,7 @@ if __name__ == "__main__":
         x = train_loader.next_batch()
         x = x.to(device)
         with ctx:
-            dec, post, loss_ae = model(x, "train", 0, step)
+            dec, post, loss_ae, loss_dict_ae = model(x, "train", 0, step)
         loss_ae.backward()
         norm = torch.nn.utils.clip_grad_norm_(
             model.parameters(), args.grad_clip)
@@ -212,7 +213,7 @@ if __name__ == "__main__":
         x = x.to(device)
 
         with ctx:
-            dec, post, loss_disc = model(x, "train", 1, step)
+            dec, post, loss_disc, loss_dict_disc = model(x, "train", 1, step)
         loss_disc.backward()
         norm = torch.nn.utils.clip_grad_norm_(
             model.parameters(), args.grad_clip)
@@ -227,10 +228,14 @@ if __name__ == "__main__":
                train disc loss {loss_disc.item():.6f} | \
                norm {norm:.4f} | \
                """)
+        if args.verbose_loss:
+            print0(f"    ae verbose loss: {loss_dict_ae}")
+            print0(f" disc verbose loss: {loss_dict_disc}")
         if logfile is not None:
             with open(logfile, "a") as f:
-                f.write("s:%d loss_ae:%f\n" % (step, loss_ae.item()))
-                f.write("s:%d loss_disc:%f\n" % (step, loss_disc.item()))
+                f.write(f"{step},")
+                f.write(f"loss_ae,{loss_ae.item()},")
+                f.write(f"loss_disc,{loss_disc.item()}")
 
         # keep track of smooth timings, last 20 iterations
         if step > 0 and step > args.num_iterations - 20:

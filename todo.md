@@ -9,7 +9,7 @@
     - [ ] batch multi-frame masking for loss
     - [ ] clean up training script logging and args and training resume (or continuation)
     - [ ] build inference pipeline
-    - [ ] validate outlier penalty loss which handles spots
+    - [x] validate outlier penalty loss which handles spots
     - [ ] efficient inference using temporal tiling
 - MovieGen pipeline
     - [ ] build training pipeline
