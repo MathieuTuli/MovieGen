@@ -184,9 +184,16 @@ if __name__ == "__main__":
                 val_loss /= args.val_max_steps
             # log to console and to file
             print0(f"val loss {val_loss}")
+            if args.verbose_loss:
+                x = " | ".join([f'{x}: {y.item():.4f}' for x, y in loss_dict.items()])  # noqa
+                print0(f"    val verbose loss: {x}")
             if logfile is not None:
                 with open(logfile, "a") as f:
                     f.write("s:%d val_loss:%f\n" % (step, val_loss))
+                    f.write(f"{step},")
+                    f.write(f"val_loss,{val_loss},")
+                    f.write(",".join([f'{x},{y.item():.4f}' for x, y in loss_dict.items()]))  # noqa
+                    f.write("\n")
 
         if last_step or args.inference_only:
             break
@@ -229,15 +236,18 @@ if __name__ == "__main__":
                norm {norm:.4f} | \
                """)
         if args.verbose_loss:
-            x = " | ".join([f'{x}: {y.item()}' for x, y in loss_dict_ae.items()])
+            x = " | ".join([f'{x}: {y.item():.4f}' for x, y in loss_dict_ae.items()])  # noqa
             print0(f"    ae verbose loss: {x}")
-            x = " | ".join([f'{x}: {y.item()}' for x, y in loss_dict_disc.items()])
+            x = " | ".join([f'{x}: {y.item():.4f}' for x, y in loss_dict_disc.items()])  # noqa
             print0(f"    disc verbose loss: {x}")
         if logfile is not None:
             with open(logfile, "a") as f:
                 f.write(f"{step},")
                 f.write(f"loss_ae,{loss_ae.item()},")
                 f.write(f"loss_disc,{loss_disc.item()}")
+                f.write(",".join([f'{x},{y.item():.4f}' for x, y in loss_dict_ae.items()]))  # noqa
+                f.write(",".join([f'{x},{y.item():.4f}' for x, y in loss_dict_disc.items()]))  # noqa
+                f.write("\n")
 
         # keep track of smooth timings, last 20 iterations
         if step > 0 and step > args.num_iterations - 20:
