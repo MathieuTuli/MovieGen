@@ -1200,8 +1200,7 @@ class LPIPSWithDiscriminator(nn.Module):
                     outlier_loss += torch.max(
                         (X[b, :, i, j] - X.mean()).norm() -
                         (self.outlier_scaling_factor * X.std()).norm(),
-                        torch.zeros_like(X[b, :, i, j],
-                                         device=inputs.device))
+                        torch.tensor([0.], device=inputs.device))
         outlier_loss /= H * W
 
         # now the GAN part

@@ -229,8 +229,10 @@ if __name__ == "__main__":
                norm {norm:.4f} | \
                """)
         if args.verbose_loss:
-            print0(f"    ae verbose loss: {loss_dict_ae}")
-            print0(f" disc verbose loss: {loss_dict_disc}")
+            x = " | ".join([f'{x}: {y.item()}' for x, y in loss_dict_ae.items()])
+            print0(f"    ae verbose loss: {x}")
+            x = " | ".join([f'{x}: {y.item()}' for x, y in loss_dict_disc.items()])
+            print0(f"    disc verbose loss: {x}")
         if logfile is not None:
             with open(logfile, "a") as f:
                 f.write(f"{step},")
