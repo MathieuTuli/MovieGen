@@ -85,10 +85,14 @@ args
 parser = argparse.ArgumentParser()
 # io
 # yes you can use parser types like this
-parser.add_argument("--ckpt", type=asspath, required=False)
 parser.add_argument("--output-dir", type=mkpath, default="")
+
+# checkpointing
+parser.add_argument("--ckpt", type=asspath, required=False)
 parser.add_argument("--ckpt-from-ldm", type=int, default=1, choices=[0, 1])
-# parser.add_argument("--tae-ckpt", type=asspath, required=False)
+parser.add_argument("--resume", type=int, default=0, choices=[0, 1])
+parser.add_argument("--ckpt-freq", type=int, default=-1)
+
 # optimization
 parser.add_argument("--lr", type=float, default=1e-5)
 parser.add_argument("--weight-decay", type=float, default=0.0)
@@ -100,8 +104,11 @@ parser.add_argument("--num-iterations", type=int, default=10)
 parser.add_argument("--val-loss-every", type=int, default=0)
 parser.add_argument("--val-max-steps", type=int, default=20)
 parser.add_argument("--overfit-batch", default=1, type=int)
+
 parser.add_argument("--inference-only", default=0, type=int, choices=[0, 1])
 parser.add_argument("--verbose-loss", default=0, type=int, choices=[0, 1])
+parser.add_argument("--seed", default=420, type=int)
+
 # memory management
 parser.add_argument("--dtype", type=str, default="float32")
 parser.add_argument("--compile", default=0, type=int)
@@ -115,6 +122,8 @@ if __name__ == "__main__":
     logfile = None
     if args.output_dir:
         logfile = args.output_dir / "main.log"
+        if args.resume == 0:
+            open(logfile, 'w').close()
 
     device = torch.device("cuda")
 
@@ -124,14 +133,15 @@ if __name__ == "__main__":
                'float16': torch.float16}[args.dtype]
     ctx = torch.amp.autocast(device_type="cuda", dtype=ptdtype)
 
-    torch.manual_seed(420)
+    torch.manual_seed(args.seed)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed(420)
+        torch.cuda.manual_seed(args.seed)
 
     config = TAEConfig()
     model = TAE(config)
     if args.ckpt:
         ignore_keys = list()
+        # The checkpoint from LDM needs to ignore certain layers
         if args.ckpt_from_ldm:
             ignore_keys = [
                     "encoder.conv_out",
@@ -139,6 +149,9 @@ if __name__ == "__main__":
                     "quant_conv",
                     "post_quant_conv",
                     ]
+
+        if args.resume == 0:
+            ignore_keys.append(["loss"])
 
         model.from_pretrained(args.ckpt, ignore_keys=ignore_keys)
 
@@ -156,10 +169,13 @@ if __name__ == "__main__":
     torch.cuda.reset_peak_memory_stats()
     timings = list()
     if args.inference_only:
-        print("Starting inference only.")
+        print0("Starting inference only.")
     else:
-        print("Starting training.")
-    for step in range(args.num_iterations + 1):
+        print0("Starting training.")
+    start_step = 0
+    if args.resume == 1:
+        start_step = torch.load(args.ckpt)["step"]
+    for step in range(start_step, args.num_iterations + 1):
         t0 = time.time()
         last_step = (step == args.num_iterations - 1)
 
@@ -175,7 +191,8 @@ if __name__ == "__main__":
                     val_loss += loss.item()
                     for b in range(dec.shape[0]):
                         for t in range(dec.shape[1]):
-                            fn = args.output_dir / f"val_dec_{vali}_{b}_{t}.png"
+                            fn = args.output_dir /\
+                                    f"val_dec_{vali}_{b}_{t}.png"
                             torchvision.transforms.ToPILImage()(
                                     (dec[b, t] + 1) * 0.5).save(fn)
                             fn = args.output_dir / f"val_x_{vali}_{b}_{t}.png"
@@ -189,9 +206,8 @@ if __name__ == "__main__":
                 print0(f"    val verbose loss: {x}")
             if logfile is not None:
                 with open(logfile, "a") as f:
-                    f.write("s:%d val_loss:%f\n" % (step, val_loss))
                     f.write(f"{step},")
-                    f.write(f"val_loss,{val_loss},")
+                    f.write(f"val/loss,{val_loss},")
                     f.write(",".join([f'{x},{y.item():.4f}' for x, y in loss_dict.items()]))  # noqa
                     f.write("\n")
 
@@ -212,6 +228,7 @@ if __name__ == "__main__":
             model.parameters(), args.grad_clip)
         # step the optimizer
         optimizer_ae.step()
+
         # --------------- DISC TRAINING SECTION BEGIN -----------------
         optimizer_disc.zero_grad(set_to_none=True)
 
@@ -243,8 +260,8 @@ if __name__ == "__main__":
         if logfile is not None:
             with open(logfile, "a") as f:
                 f.write(f"{step},")
-                f.write(f"loss_ae,{loss_ae.item()},")
-                f.write(f"loss_disc,{loss_disc.item()}")
+                f.write(f"train/toss_ae,{loss_ae.item()},")
+                f.write(f"train/toss_disc,{loss_disc.item()}")
                 f.write(",".join([f'{x},{y.item():.4f}' for x, y in loss_dict_ae.items()]))  # noqa
                 f.write(",".join([f'{x},{y.item():.4f}' for x, y in loss_dict_disc.items()]))  # noqa
                 f.write("\n")
@@ -253,12 +270,16 @@ if __name__ == "__main__":
         if step > 0 and step > args.num_iterations - 20:
             timings.append(t1 - t0)
 
+        if step > 0 and args.ckpt_freqq > 0 and step % args.ckpt_freq == 0:
+            torch.save({"step": step, "state_dict": model.state_dict()},
+                       args.output_dir / f"tae_{step}.ckpt")
+
     # print the average of the last 20 timings, to get something smooth-ish
     timings = timings[-20:]
     print0(f"final {len(timings)} iters avg: {np.mean(timings)*1000:.3f}ms")
     print0(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")  # NOQA
 
-    torch.save({"state_dict": model.state_dict()},
-               args.output_dir / "tae.ckpt")
+    torch.save({"step": step, "state_dict": model.state_dict()},
+               args.output_dir / "tae_last.ckpt")
 
     # -------------------------------------------------------------------------

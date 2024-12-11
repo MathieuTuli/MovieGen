@@ -1358,11 +1358,6 @@ class TAE(nn.Module):
                     print("    - Deleting key {} from state_dict.".format(k))
                     del sd[k]
 
-        # REVISIT: update this to train tae
-        for k in list(sd.keys()):
-            if k.startswith("loss"):
-                del sd[k]
-
         temp_sd = self.state_dict()
         for k in temp_sd:
             if "temp_" in k and k not in sd:
@@ -1389,7 +1384,6 @@ class TAE(nn.Module):
         moments = self.quant_conv(x)
         _, C, H, W = moments.shape
         moments = moments.view(B, T, C, H, W)
-        # REVISIT: this
         posterior = DiagonalGaussianDistribution(moments)
         return posterior
 
