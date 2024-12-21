@@ -1,5 +1,6 @@
 # local
 pretrained-weights
+tmp
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

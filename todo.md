@@ -20,6 +20,7 @@ TODOs for MovieGen implementation
 - [ ] build inference pipeline
 - [x] validate outlier penalty loss which handles spots
     - it produces odd results to be honest, introducing even more artifacts for me, needs more investigation
+    - it's working, but the weight needs to be tuned different from the paper
 - [ ] resume training
     - ~save opt state~
     - save loss state

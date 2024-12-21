@@ -1127,7 +1127,7 @@ class LPIPSWithDiscriminator(nn.Module):
                  perceptual_weight=1.0, use_actnorm=False,
                  disc_conditional=False, disc_loss="hinge",
                  outlier_scaling_factor: int = 3,
-                 outlier_loss_weight: float = 1e5):
+                 outlier_loss_weight: float = 0):
 
         super().__init__()
         assert disc_loss in ["hinge", "vanilla"]
@@ -1297,6 +1297,8 @@ class TAEConfig:
     loss_disc_start: int = 5001
     loss_kl_weight: float = 1e-6
     loss_disc_weight: float = 0.5
+    loss_outlier_weight: float = 1e2
+    loss_outlier_scaling_factor: float = 3
 
     def __init__(self, **kwargs):
         for k, v in kwargs.items():
@@ -1345,7 +1347,10 @@ class TAE(nn.Module):
         self.loss = LPIPSWithDiscriminator(
             disc_start=config.loss_disc_start,
             kl_weight=config.loss_kl_weight,
-            disc_weight=config.loss_disc_weight)
+            disc_weight=config.loss_disc_weight,
+            outlier_scaling_factor=config.loss_outlier_scaling_factor,
+            outlier_loss_weight=config.loss_outlier_weight,
+            )
 
     def from_pretrained(self, ckpt: Path, ignore_keys: List[str] = None,):
         ignore_keys = ignore_keys or list()
