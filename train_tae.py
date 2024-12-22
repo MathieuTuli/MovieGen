@@ -16,44 +16,82 @@ from metrics import collect_metrics
 from tae import TAE, TAEConfig
 
 
-class DataLoader:
-    def __init__(self, fname, size: int = 64, train: bool = True):
+class DistributedDataLoader:
+    def __init__(self,
+                 root: Path,
+                 B: int, T: int,
+                 rank: int, world_size: int,
+                 size: int = 64, train: bool = True):
         self.train = train
-        vidcap = cv2.VideoCapture(fname)
-        ret, x = vidcap.read()
-        x = Image.fromarray(cv2.cvtColor(x, cv2.COLOR_BGR2RGB))
-        transforms = torchvision.transforms.Compose([
+        self.B, self.T, self.rank, self.world_size = B, T, rank, world_size
+        self.files = list()
+        for ext in ('*.mp4', '*.avi', '*.mov', '*.mkv', '*.webm', '*.gif'):
+            self.files.extend(root.glob(ext))
+        self.files = sorted(self.files)  # Sort for consistency
+
+        self.transforms = torchvision.transforms.Compose([
             torchvision.transforms.Resize(size),
             torchvision.transforms.PILToTensor(),
             torchvision.transforms.ConvertImageDtype(torch.float32),
             torchvision.transforms.Normalize([0.5], [0.5]),
-            ])
-        x = transforms(x)[None, :]
+        ])
+
+        self.count = -1
+        self.indices = [x for x in range(0, len(self.files))]
+        if train:
+            random.shuffle(self.indices)
+
+    def reset(self):
+        self.count = self.rank * self.B
+
+    def load_video(self, fname):
+        vidcap = cv2.VideoCapture(fname)
+        ret, x = vidcap.read()
+        x = Image.fromarray(cv2.cvtColor(x, cv2.COLOR_BGR2RGB))
+        x = self.transforms(x)[None, :]
         while ret:
             ret, frame = vidcap.read()
             if ret:
                 frame = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-                x = torch.cat([x, transforms(frame)[None, :]])
-        self.x = x
-        self.count = -1
-
-    def reset(self):
-        self.count = -1
+                x = torch.cat([x, self.transforms(frame)[None, :]])
+        return x
 
     def next_batch(self):
-        self.count += 1
-        if self.train:
+        # you're always safe to read the B videos from indices
+        x, mask = torch.empty(0), torch.ones([self.B, self.T])
+        for i in range(self.B):
+            video = self.load_video(self.files[self.indices[self.count]])
+            vlen = video.shape[0]
+            # 1:3 image/video ratio from paper
             if self.count % 4 == 0:
-                id = random.randint(0, self.x.shape[0] - 1)
-                return self.x[id][None, None, :]
+                id = random.randint(0, vlen - 1) if self.train else 0
+                frame = video[id]
+                zero_pad = torch.zeros(1, self.T - 1, *frame.shape,
+                                       dtype=frame.dtype)
+                frame = torch.cat([frame[None, None, :], zero_pad], dim=1)
+                x = torch.cat([x, frame])
+                mask[i, 1:] = 0
             else:
-                id = random.randint(0, self.x.shape[0] - 1)
-                return self.x[None, id:id+32]
-        else:
-            if self.count % 4 == 0:
-                return self.x[self.count][None, None, :]
-            else:
-                return self.x[None, self.count:self.count+32]
+                id = 0
+                if self.train:
+                    id = random.randint(0, max(vlen - self.T - 1, 0))
+                frames = video[id:id + self.T]
+                if frames.shape[0] < self.T:
+                    zero_pad = torch.zeros(self.T - frames.shape[0],
+                                           *frames.shape[1:],
+                                           dtype=frame.dtype)
+                    frames = torch.cat([frames, zero_pad], dim=0)
+                x = torch.cat([x, frames[None, :]])
+                mask[i, x.shape[1]:] = 0
+            self.count += 1
+            if self.count >= len(self.files):
+                self.count = self.rank * self.B
+        self.count += self.world_size * self.B
+        # this will lose some videos at the end but who cares
+        if self.count + self.B >= len(self.files):
+            self.count = self.rank * self.B
+
+        return x, mask
 
 
 """
@@ -97,6 +135,8 @@ parser = argparse.ArgumentParser()
 # io
 # yes you can use parser types like this
 parser.add_argument("--output-dir", type=mkpath, default="")
+parser.add_argument("--train-dir", type=asspath, default="dev/data/train-smol")
+parser.add_argument("--val-dir", type=asspath, default="dev/data/val-smol")
 
 # checkpointing
 parser.add_argument("--ckpt", type=asspath, required=False)
@@ -107,9 +147,10 @@ parser.add_argument("--ckpt-freq", type=int, default=-1)
 # optimization
 parser.add_argument("--lr", type=float, default=1e-5)
 parser.add_argument("--weight-decay", type=float, default=0.0)
-parser.add_argument("--grad_clip", type=float, default=1.0)
-parser.add_argument("--fps", type=int, default=16)
+parser.add_argument("--grad-clip", type=float, default=1.0)
 parser.add_argument("--batch-size", type=int, default=1)
+parser.add_argument("--max-frames", type=int, default=32)
+parser.add_argument("--resolution", type=int, default=64)
 
 parser.add_argument("--num-iterations", type=int, default=10)
 parser.add_argument("--val-loss-every", type=int, default=0)
@@ -153,7 +194,8 @@ if __name__ == "__main__":
     config = TAEConfig()
     model = TAE(config)
     total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    trainable_params = sum(p.numel()
+                           for p in model.parameters() if p.requires_grad)
     print0(f"Total Parameters: {total_params:,}")
     print0(f"Trainable Parameters: {trainable_params:,}")
     if args.ckpt:
@@ -161,11 +203,11 @@ if __name__ == "__main__":
         # The checkpoint from LDM needs to ignore certain layers
         if args.ckpt_from_ldm == 1:
             ignore_keys = [
-                    "encoder.conv_out",
-                    "decoder.conv_in",
-                    "quant_conv",
-                    "post_quant_conv",
-                    ]
+                "encoder.conv_out",
+                "decoder.conv_in",
+                "quant_conv",
+                "post_quant_conv",
+            ]
 
         # if args.resume == 0:
         #     ignore_keys.append("loss")
@@ -176,12 +218,16 @@ if __name__ == "__main__":
         model = torch.compile(model)
     model.to(device)
 
-    train_loader = DataLoader("rickroll.gif")
-    val_loader = DataLoader("rickroll.gif", train=False)
+    train_loader = DistributedDataLoader(
+            args.train_dir, B=args.batch_size, T=args.max_frames,
+            rank=0, world_size=1, size=args.resolution)
+    val_loader = DistributedDataLoader(
+            args.val_dir, B=args.batch_size, T=args.max_frames,
+            rank=0, world_size=1, size=args.resolution, train=False)
 
     optimizer_ae, optimizer_disc = model.configure_optimizers(
-            lr=args.lr, weight_decay=args.weight_decay,
-            betas=(0.5, 0.9))
+        lr=args.lr, weight_decay=args.weight_decay,
+        betas=(0.5, 0.9))
 
     torch.cuda.reset_peak_memory_stats()
     timings = list()
@@ -203,29 +249,29 @@ if __name__ == "__main__":
                 val_loss = 0.
                 val_loader.reset()
                 metrics = {
-                        "psnr_image": list(),
-                        "ssim_image": list(),
-                        "psnr_video": list(),
-                        "ssim_video": list(),
-                        }
+                    "psnr_image": list(),
+                    "ssim_image": list(),
+                    "psnr_video": list(),
+                    "ssim_video": list(),
+                }
                 for vali in range(args.val_max_steps):
-                    x = val_loader.next_batch()
-                    x = x.to(device)
+                    x, mask = val_loader.next_batch()
+                    x, mask = x.to(device), mask.to(device)
                     dec, _, loss, loss_dict = model(x, "val", 1, step)
                     val_loss += loss.item()
                     metrics = collect_metrics(
-                            dec.permute(0, 1, 3, 4, 2).cpu().numpy(),
-                            x.permute(0, 1, 3, 4, 2).cpu().numpy(),
-                            metrics)
+                        dec.permute(0, 1, 3, 4, 2).cpu().numpy(),
+                        x.permute(0, 1, 3, 4, 2).cpu().numpy(),
+                        metrics)
                     for b in range(dec.shape[0]):
                         for t in range(dec.shape[1]):
                             fn = args.output_dir /\
-                                    f"val_dec_{vali}_{b}_{t}.png"
+                                f"val_dec_{vali}_{b}_{t}.png"
                             torchvision.transforms.ToPILImage()(
-                                    (dec[b, t] + 1) * 0.5).save(fn)
+                                (dec[b, t] + 1) * 0.5).save(fn)
                             fn = args.output_dir / f"val_x_{vali}_{b}_{t}.png"
                             torchvision.transforms.ToPILImage()(
-                                    (x[b, t] + 1) * 0.5).save(fn)
+                                (x[b, t] + 1) * 0.5).save(fn)
                 val_loss /= args.val_max_steps
             # log to console and to file
             print0(f"val loss {val_loss}")
@@ -252,8 +298,8 @@ if __name__ == "__main__":
         optimizer_ae.zero_grad(set_to_none=True)
 
         # fetch a batch
-        x = train_loader.next_batch()
-        x = x.to(device)
+        x, mask = train_loader.next_batch()
+        x, mask = x.to(device), mask.to(device)
         with ctx:
             dec, post, loss_ae, loss_dict_ae = model(x, "train", 0, step)
         loss_ae.backward()
@@ -266,8 +312,9 @@ if __name__ == "__main__":
         optimizer_disc.zero_grad(set_to_none=True)
 
         # fetch a batch
-        x = train_loader.next_batch()
-        x = x.to(device)
+        # REVISIT: should I be getting the next batch here?
+        # x, mask = train_loader.next_batch()
+        # x, mask = x.to(device), mask.to(device)
 
         with ctx:
             dec, post, loss_disc, loss_dict_disc = model(x, "train", 1, step)
