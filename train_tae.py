@@ -2,11 +2,16 @@ from pathlib import Path
 
 import argparse
 import random
+import signal
 import time
 import os
 
+
+from torch.distributed import init_process_group, destroy_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
 from PIL import Image
 
+import torch.distributed as dist
 import numpy as np
 import torchvision
 import torch
@@ -28,9 +33,11 @@ class DistributedDataLoader:
         for ext in ('*.mp4', '*.avi', '*.mov', '*.mkv', '*.webm', '*.gif'):
             self.files.extend(root.glob(ext))
         self.files = sorted(self.files)  # Sort for consistency
+        assert len(self.files) >= world_size * B, \
+            f"Have {len(self.files)}, need {world_size * B} files"
 
         self.transforms = torchvision.transforms.Compose([
-            torchvision.transforms.Resize(size),
+            torchvision.transforms.Resize((size, size)),
             torchvision.transforms.PILToTensor(),
             torchvision.transforms.ConvertImageDtype(torch.float32),
             torchvision.transforms.Normalize([0.5], [0.5]),
@@ -125,6 +132,19 @@ def print0(*args, **kwargs):
         print(*args, **kwargs)
 
 
+def cleanup():
+    """Cleanup function to destroy the process group"""
+    if int(os.environ.get('RANK', -1)) != -1:
+        destroy_process_group()
+
+
+def signal_handler(sig, frame):
+    """Handle Ctrl+C gracefully"""
+    print0("\nCtrl+C caught. Cleaning up...")
+    cleanup()
+    exit(0)
+
+
 """
 -------------------------------------------------------------------------------
 args
@@ -143,6 +163,7 @@ parser.add_argument("--ckpt", type=asspath, required=False)
 parser.add_argument("--ckpt-from-ldm", type=int, default=0, choices=[0, 1])
 parser.add_argument("--resume", type=int, default=0, choices=[0, 1])
 parser.add_argument("--ckpt-freq", type=int, default=-1)
+parser.add_argument("--device", type=str, default="cuda")
 
 # optimization
 parser.add_argument("--lr", type=float, default=1e-5)
@@ -167,9 +188,10 @@ parser.add_argument("--compile", default=0, type=int)
 
 
 if __name__ == "__main__":
+    signal.signal(signal.SIGINT, signal_handler)
     args = parser.parse_args()
     # args error checking
-    assert args.dtype in {"float32", "float16", "bfloat16"}
+    assert args.dtype in {"float32"}
 
     train_logfile, val_logfile = None, None
     if args.output_dir:
@@ -179,13 +201,22 @@ if __name__ == "__main__":
             open(train_logfile, 'w').close()
             open(val_logfile, 'w').close()
 
-    device = torch.device("cuda")
-
-    # set up a context manager following the desired dtype and device
-    ptdtype = {'float32': torch.float32,
-               'bfloat16': torch.bfloat16,
-               'float16': torch.float16}[args.dtype]
-    ctx = torch.amp.autocast(device_type="cuda", dtype=ptdtype)
+    ddp = int(os.environ.get('RANK', -1)) != -1  # is this a ddp run?
+    if ddp:
+        assert torch.cuda.is_available(), "We need CUDA for DDP"
+        init_process_group(backend='nccl')
+        ddp_rank = int(os.environ['RANK'])
+        ddp_local_rank = int(os.environ['LOCAL_RANK'])
+        ddp_world_size = int(os.environ['WORLD_SIZE'])
+        device = f'cuda:{ddp_local_rank}'
+        torch.cuda.set_device(device)
+        master_process = ddp_rank == 0
+    else:
+        ddp_rank = 0
+        ddp_local_rank = 0
+        ddp_world_size = 1
+        master_process = True
+        device = torch.device(args.device)
 
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
@@ -214,18 +245,29 @@ if __name__ == "__main__":
 
         model.from_pretrained(args.ckpt, ignore_keys=ignore_keys)
 
+    model.train()
     if args.compile:
         model = torch.compile(model)
     model.to(device)
 
+    batch_size = args.batch_size
+    if ddp:
+        batch_size = args.batch_size // ddp_world_size
     train_loader = DistributedDataLoader(
-            args.train_dir, B=args.batch_size, T=args.max_frames,
-            rank=0, world_size=1, size=args.resolution)
+            args.train_dir, B=batch_size, T=args.max_frames,
+            rank=ddp_rank, world_size=ddp_world_size,
+            size=args.resolution)
     val_loader = DistributedDataLoader(
-            args.val_dir, B=args.batch_size, T=args.max_frames,
-            rank=0, world_size=1, size=args.resolution, train=False)
+            args.val_dir, B=batch_size, T=args.max_frames,
+            rank=ddp_rank, world_size=ddp_world_size,
+            size=args.resolution, train=False)
 
-    optimizer_ae, optimizer_disc = model.configure_optimizers(
+    if ddp:
+        model = DDP(model, device_ids=[ddp_local_rank],
+                    find_unused_parameters=True)
+    unwrapped_model = model.module if ddp else model
+
+    optimizer_ae, optimizer_disc = unwrapped_model.configure_optimizers(
         lr=args.lr, weight_decay=args.weight_decay,
         betas=(0.5, 0.9))
 
@@ -235,6 +277,7 @@ if __name__ == "__main__":
         print0("Starting inference only.")
     else:
         print0("Starting training.")
+
     start_step = 0
     if args.resume == 1:
         start_step = torch.load(args.ckpt)["step"]
@@ -243,7 +286,7 @@ if __name__ == "__main__":
         last_step = (step == args.num_iterations - 1)
 
         # once in a while evaluate the validation dataset
-        if ((args.val_loss_every > 0 and step % args.val_loss_every == 0) or last_step or args.inference_only) and (val_loader is not None):  # noqa
+        if ((args.val_loss_every > 0 and step % args.val_loss_every == 0) or last_step or args.inference_only) and (val_loader is not None) and master_process:  # noqa
             model.eval()
             with torch.no_grad():
                 val_loss = 0.
@@ -300,9 +343,10 @@ if __name__ == "__main__":
         # fetch a batch
         x, mask = train_loader.next_batch()
         x, mask = x.to(device), mask.to(device)
-        with ctx:
-            dec, post, loss_ae, loss_dict_ae = model(x, "train", 0, step)
+        dec, post, loss_ae, loss_dict_ae = model(x, "train", 0, step)
         loss_ae.backward()
+        # if ddp:
+        #     dist.all_reduce(loss_ae, op=dist.ReduceOp.AVG)
         norm = torch.nn.utils.clip_grad_norm_(
             model.parameters(), args.grad_clip)
         # step the optimizer
@@ -316,9 +360,10 @@ if __name__ == "__main__":
         # x, mask = train_loader.next_batch()
         # x, mask = x.to(device), mask.to(device)
 
-        with ctx:
-            dec, post, loss_disc, loss_dict_disc = model(x, "train", 1, step)
+        dec, post, loss_disc, loss_dict_disc = model(x, "train", 1, step)
         loss_disc.backward()
+        # # if ddp:
+        # #     dist.all_reduce(loss_disc, op=dist.ReduceOp.AVG)
         norm = torch.nn.utils.clip_grad_norm_(
             model.parameters(), args.grad_clip)
         # step the optimizer
@@ -337,7 +382,7 @@ if __name__ == "__main__":
             print0(f"    ae verbose loss: {x}")
             x = " | ".join([f'{x}: {y.item():.4f}' for x, y in loss_dict_disc.items()])  # noqa
             print0(f"    disc verbose loss: {x}")
-        if train_logfile is not None:
+        if master_process and train_logfile is not None:
             with open(train_logfile, "a") as f:
                 f.write(f"{step},")
                 f.write(f"train/toss_ae,{loss_ae.item()},")
@@ -350,8 +395,8 @@ if __name__ == "__main__":
         if step > 0 and step > args.num_iterations - 20:
             timings.append(t1 - t0)
 
-        if step > 0 and args.ckpt_freq > 0 and step % args.ckpt_freq == 0:
-            torch.save({"step": step, "state_dict": model.state_dict()},
+        if master_process and step > 0 and args.ckpt_freq > 0 and step % args.ckpt_freq == 0:
+            torch.save({"step": step, "state_dict": unwrapped_model.state_dict()},
                        args.output_dir / f"tae_{step}.ckpt")
 
     # print the average of the last 20 timings, to get something smooth-ish
@@ -359,7 +404,9 @@ if __name__ == "__main__":
     print0(f"final {len(timings)} iters avg: {np.mean(timings)*1000:.3f}ms")
     print0(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")  # NOQA
 
-    torch.save({"step": step, "state_dict": model.state_dict()},
-               args.output_dir / "tae_last.ckpt")
+    if master_process:
+        torch.save({"step": step, "state_dict": model.state_dict()},
+                   args.output_dir / "tae_last.ckpt")
 
+    cleanup()
     # -------------------------------------------------------------------------

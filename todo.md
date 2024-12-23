@@ -40,6 +40,8 @@ TODOs for MovieGen implementation
 - [ ] MovieGen: DDP loader
 - [ ] TAE: efficient inference using temporal tiling
 - [ ] TAE: dataloader loads and discards a video file, could optimize this and use all frames in a video file or something
+- [ ] TAE: grad accum
+- [ ] TAE: optimize multi-processing dataloader
 
 # QOL
 - [ ] implement terminal-based logging/chart plotting
