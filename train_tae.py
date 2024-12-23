@@ -280,7 +280,7 @@ if __name__ == "__main__":
                     if vali >= args.val_max_steps:
                         break
                     x, mask = x.to(device), mask.to(device)
-                    dec, _, loss, loss_dict = model(x, "val", 1, step)
+                    dec, _, loss, loss_dict = model(x, mask, "val", 1, step)
                     val_loss += loss.item()
                     metrics = collect_metrics(
                         dec.permute(0, 1, 3, 4, 2).cpu().numpy(),
@@ -323,7 +323,7 @@ if __name__ == "__main__":
         # fetch a batch
         x, mask = next(train_iter)
         x, mask = x.to(device), mask.to(device)
-        dec, post, loss_ae, loss_dict_ae = model(x, "train", 0, step)
+        dec, post, loss_ae, loss_dict_ae = model(x, mask, "train", 0, step)
         loss_ae.backward()
         # if ddp:
         #     dist.all_reduce(loss_ae, op=dist.ReduceOp.AVG)
@@ -340,7 +340,7 @@ if __name__ == "__main__":
         # x, mask = train_loader.next_batch()
         # x, mask = x.to(device), mask.to(device)
 
-        dec, post, loss_disc, loss_dict_disc = model(x, "train", 1, step)
+        dec, post, loss_disc, loss_dict_disc = model(x, mask, "train", 1, step)
         loss_disc.backward()
         # # if ddp:
         # #     dist.all_reduce(loss_disc, op=dist.ReduceOp.AVG)

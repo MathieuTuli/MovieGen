@@ -1169,11 +1169,18 @@ class LPIPSWithDiscriminator(nn.Module):
         d_weight = d_weight * self.discriminator_weight
         return d_weight
 
-    def forward(self, inputs, reconstructions, posteriors, optimizer_idx,
+    def forward(self, inputs, reconstructions, mask, posteriors, optimizer_idx,
                 global_step, last_layer=None, cond=None, split="train",
                 weights=None):
         inputs = inputs.flatten(0, 1)
         reconstructions = reconstructions.flatten(0, 1)
+
+        # NOTE: removed masked elements
+        mask = mask.flatten(0, 1)
+        valid_mask = mask != 0
+        inputs = inputs[valid_mask]
+        reconstructions = reconstructions[valid_mask]
+
         rec_loss = torch.abs(inputs.contiguous() -
                              reconstructions.contiguous())
         if self.perceptual_weight > 0:
@@ -1350,7 +1357,7 @@ class TAE(nn.Module):
             disc_weight=config.loss_disc_weight,
             outlier_scaling_factor=config.loss_outlier_scaling_factor,
             outlier_loss_weight=config.loss_outlier_weight,
-            )
+        )
 
     def from_pretrained(self, ckpt: Path, ignore_keys: List[str] = None,):
         ignore_keys = ignore_keys or list()
@@ -1403,7 +1410,10 @@ class TAE(nn.Module):
         # temporal accounting
         return dec
 
-    def forward(self, inputs, split, optimizer_idx, step,
+    def forward(self, inputs, mask,
+                split: str = "val",
+                optimizer_idx: int = 0,
+                step: int = 0,
                 sample_posterior=True):
         # temporal accounting
         posterior = self.encode(inputs)
@@ -1412,14 +1422,14 @@ class TAE(nn.Module):
         else:
             z = posterior.mode()
         dec = self.decode(z)
-        Tprime = inputs.shape[1]
-        assert dec.shape[1] >= Tprime
-        # limit = dec.shape[1] - Tprime
-        dec = dec[:, :Tprime]
+        # REVISIT: is this needed?
+        # Tprime = inputs.shape[1]
+        # assert dec.shape[1] >= Tprime
+        # dec = dec[:, :Tprime]
 
         loss, log_dict = self.loss(
-            inputs, dec, posterior, optimizer_idx,  # 1 for val
-            step, last_layer=self.last_layer, split="train")
+            inputs, dec, mask, posterior, optimizer_idx,  # 1 for val
+            step, last_layer=self.last_layer, split=split)
         return dec, posterior, loss, log_dict
 
     def configure_optimizers(

@@ -43,6 +43,7 @@ TODOs for MovieGen implementation
 - [ ] TAE: grad accum
 - [ ] TAE: optimize multi-processing dataloader
 - [ ] TAE: valset is split from DDP, which shouldn't happen
+- [ ] TAE: preprocess dataset and preload chunks like in llm.c
 
 # QOL
 - [ ] implement terminal-based logging/chart plotting
