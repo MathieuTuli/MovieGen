@@ -9,9 +9,11 @@ import os
 
 from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
+from torch.utils.data import DataLoader
 from PIL import Image
 
-import torch.distributed as dist
+# import torch.distributed as dist
 import numpy as np
 import torchvision
 import torch
@@ -21,21 +23,14 @@ from metrics import collect_metrics
 from tae import TAE, TAEConfig
 
 
-class DistributedDataLoader:
-    def __init__(self,
-                 root: Path,
-                 B: int, T: int,
-                 rank: int, world_size: int,
-                 size: int = 64, train: bool = True):
+class Dataset:
+    def __init__(self, root: Path, T: int, size: int = 64, train: bool = True):
         self.train = train
-        self.B, self.T, self.rank, self.world_size = B, T, rank, world_size
+        self.T = T
         self.files = list()
         for ext in ('*.mp4', '*.avi', '*.mov', '*.mkv', '*.webm', '*.gif'):
             self.files.extend(root.glob(ext))
         self.files = sorted(self.files)  # Sort for consistency
-        assert len(self.files) >= world_size * B, \
-            f"Have {len(self.files)}, need {world_size * B} files"
-
         self.transforms = torchvision.transforms.Compose([
             torchvision.transforms.Resize((size, size)),
             torchvision.transforms.PILToTensor(),
@@ -43,13 +38,8 @@ class DistributedDataLoader:
             torchvision.transforms.Normalize([0.5], [0.5]),
         ])
 
-        self.count = -1
-        self.indices = [x for x in range(0, len(self.files))]
-        if train:
-            random.shuffle(self.indices)
-
-    def reset(self):
-        self.count = self.rank * self.B
+    def __len__(self):
+        return len(self.files)
 
     def load_video(self, fname):
         vidcap = cv2.VideoCapture(fname)
@@ -63,41 +53,29 @@ class DistributedDataLoader:
                 x = torch.cat([x, self.transforms(frame)[None, :]])
         return x
 
-    def next_batch(self):
-        # you're always safe to read the B videos from indices
-        x, mask = torch.empty(0), torch.ones([self.B, self.T])
-        for i in range(self.B):
-            video = self.load_video(self.files[self.indices[self.count]])
-            vlen = video.shape[0]
-            # 1:3 image/video ratio from paper
-            if self.count % 4 == 0:
-                id = random.randint(0, vlen - 1) if self.train else 0
-                frame = video[id]
-                zero_pad = torch.zeros(1, self.T - 1, *frame.shape,
+    def __getitem__(self, index):
+        mask = torch.ones([self.T])
+        video = self.load_video(self.files[index])
+        vlen = video.shape[0]
+        # 1:3 image/video ratio from paper
+        if index % 4 == 0:
+            id = random.randint(0, vlen - 1) if self.train else 0
+            frame = video[id]
+            zero_pad = torch.zeros(self.T - 1, *frame.shape,
+                                   dtype=frame.dtype)
+            x = torch.cat([frame[None, :], zero_pad], dim=0)
+            mask[1:] = 0
+        else:
+            id = 0
+            if self.train:
+                id = random.randint(0, max(vlen - self.T - 1, 0))
+            x = video[id:id + self.T]
+            if x.shape[0] < self.T:
+                zero_pad = torch.zeros(self.T - x.shape[0],
+                                       *x.shape[1:],
                                        dtype=frame.dtype)
-                frame = torch.cat([frame[None, None, :], zero_pad], dim=1)
-                x = torch.cat([x, frame])
-                mask[i, 1:] = 0
-            else:
-                id = 0
-                if self.train:
-                    id = random.randint(0, max(vlen - self.T - 1, 0))
-                frames = video[id:id + self.T]
-                if frames.shape[0] < self.T:
-                    zero_pad = torch.zeros(self.T - frames.shape[0],
-                                           *frames.shape[1:],
-                                           dtype=frame.dtype)
-                    frames = torch.cat([frames, zero_pad], dim=0)
-                x = torch.cat([x, frames[None, :]])
-                mask[i, x.shape[1]:] = 0
-            self.count += 1
-            if self.count >= len(self.files):
-                self.count = self.rank * self.B
-        self.count += self.world_size * self.B
-        # this will lose some videos at the end but who cares
-        if self.count + self.B >= len(self.files):
-            self.count = self.rank * self.B
-
+                x = torch.cat([x, zero_pad], dim=0)
+            mask[x.shape[1]:] = 0
         return x, mask
 
 
@@ -250,17 +228,15 @@ if __name__ == "__main__":
         model = torch.compile(model)
     model.to(device)
 
-    batch_size = args.batch_size
-    if ddp:
-        batch_size = args.batch_size // ddp_world_size
-    train_loader = DistributedDataLoader(
-            args.train_dir, B=batch_size, T=args.max_frames,
-            rank=ddp_rank, world_size=ddp_world_size,
-            size=args.resolution)
-    val_loader = DistributedDataLoader(
-            args.val_dir, B=batch_size, T=args.max_frames,
-            rank=ddp_rank, world_size=ddp_world_size,
-            size=args.resolution, train=False)
+    trainset = Dataset(args.train_dir, T=args.max_frames, size=args.resolution)
+    valset = Dataset(args.val_dir, T=args.max_frames,
+                     size=args.resolution, train=False)
+    train_sampler = DistributedSampler(trainset, shuffle=True) if ddp else None
+    val_sampler = DistributedSampler(valset) if ddp else None
+    train_loader = DataLoader(trainset, shuffle=(train_sampler is None),
+                                   num_workers=4, sampler=train_sampler)
+    val_loader = DataLoader(valset, shuffle=False,
+                            num_workers=4, sampler=val_sampler)
 
     if ddp:
         model = DDP(model, device_ids=[ddp_local_rank],
@@ -281,7 +257,11 @@ if __name__ == "__main__":
     start_step = 0
     if args.resume == 1:
         start_step = torch.load(args.ckpt)["step"]
+    trainset_size = len(trainset) // ddp_world_size if ddp else len(trainset)
     for step in range(start_step, args.num_iterations + 1):
+        if step % trainset_size == 0:
+            train_sampler.set_epoch(step % len(trainset))
+            train_iter = iter(train_loader)
         t0 = time.time()
         last_step = (step == args.num_iterations - 1)
 
@@ -290,15 +270,15 @@ if __name__ == "__main__":
             model.eval()
             with torch.no_grad():
                 val_loss = 0.
-                val_loader.reset()
                 metrics = {
                     "psnr_image": list(),
                     "ssim_image": list(),
                     "psnr_video": list(),
                     "ssim_video": list(),
                 }
-                for vali in range(args.val_max_steps):
-                    x, mask = val_loader.next_batch()
+                for vali, (x, mask) in enumerate(val_loader):
+                    if vali >= args.val_max_steps:
+                        break
                     x, mask = x.to(device), mask.to(device)
                     dec, _, loss, loss_dict = model(x, "val", 1, step)
                     val_loss += loss.item()
@@ -341,7 +321,7 @@ if __name__ == "__main__":
         optimizer_ae.zero_grad(set_to_none=True)
 
         # fetch a batch
-        x, mask = train_loader.next_batch()
+        x, mask = next(train_iter)
         x, mask = x.to(device), mask.to(device)
         dec, post, loss_ae, loss_dict_ae = model(x, "train", 0, step)
         loss_ae.backward()

@@ -42,6 +42,7 @@ TODOs for MovieGen implementation
 - [ ] TAE: dataloader loads and discards a video file, could optimize this and use all frames in a video file or something
 - [ ] TAE: grad accum
 - [ ] TAE: optimize multi-processing dataloader
+- [ ] TAE: valset is split from DDP, which shouldn't happen
 
 # QOL
 - [ ] implement terminal-based logging/chart plotting
