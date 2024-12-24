@@ -10,6 +10,8 @@ from pathlib import Path
 
 import argparse
 import inspect
+import random
+import signal
 import time
 import math
 import os
@@ -19,11 +21,14 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn import functional as F
 from einops import rearrange
 from torch import einsum
+from PIL import Image
 
-import torch.distributed as dist
+# import torch.distributed as dist
 import torch.nn as nn
 import numpy as np
+import torchvision
 import torch
+import cv2
 
 from text_encoder import TextEncoder, TextEncoderConfig
 from tae import TAE, TAEConfig
@@ -66,6 +71,19 @@ def print0(*args, **kwargs):
     """modified print that only prints from the master process"""
     if int(os.environ.get("RANK", 0)) == 0:
         print(*args, **kwargs)
+
+
+def cleanup():
+    """Cleanup function to destroy the process group"""
+    if int(os.environ.get('RANK', -1)) != -1:
+        destroy_process_group()
+
+
+def signal_handler(sig, frame):
+    """Handle Ctrl+C gracefully"""
+    print0("\nCtrl+C caught. Cleaning up...")
+    cleanup()
+    exit(0)
 
 
 """
@@ -616,10 +634,60 @@ dataloader
 """
 
 
-class DDataLoader:
-    def __init__(self):
-        # TODO: prepend "FPS-16" to prompts
-        pass
+class Dataset:
+    def __init__(self, root: Path, T: int, size: int = 64, train: bool = True):
+        self.train = train
+        self.T = T
+        self.files = list()
+        for ext in ('*.mp4', '*.avi', '*.mov', '*.mkv', '*.webm', '*.gif'):
+            self.files.extend(root.glob(ext))
+        self.files = sorted(self.files)  # Sort for consistency
+        self.transforms = torchvision.transforms.Compose([
+            torchvision.transforms.Resize((size, size)),
+            torchvision.transforms.PILToTensor(),
+            torchvision.transforms.ConvertImageDtype(torch.float32),
+            torchvision.transforms.Normalize([0.5], [0.5]),
+        ])
+
+    def __len__(self):
+        return len(self.files)
+
+    def load_video(self, fname):
+        vidcap = cv2.VideoCapture(fname)
+        ret, x = vidcap.read()
+        x = Image.fromarray(cv2.cvtColor(x, cv2.COLOR_BGR2RGB))
+        x = self.transforms(x)[None, :]
+        while ret:
+            ret, frame = vidcap.read()
+            if ret:
+                frame = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                x = torch.cat([x, self.transforms(frame)[None, :]])
+        return x
+
+    def __getitem__(self, index):
+        mask = torch.ones([self.T])
+        video = self.load_video(self.files[index])
+        vlen = video.shape[0]
+        # 1:3 image/video ratio from paper
+        if index % 4 == 0:
+            id = random.randint(0, vlen - 1) if self.train else 0
+            frame = video[id]
+            zero_pad = torch.zeros(self.T - 1, *frame.shape,
+                                   dtype=frame.dtype)
+            x = torch.cat([frame[None, :], zero_pad], dim=0)
+            mask[1:] = 0
+        else:
+            id = 0
+            if self.train:
+                id = random.randint(0, max(vlen - self.T - 1, 0))
+            x = video[id:id + self.T]
+            if x.shape[0] < self.T:
+                zero_pad = torch.zeros(self.T - x.shape[0],
+                                       *x.shape[1:],
+                                       dtype=frame.dtype)
+                x = torch.cat([x, zero_pad], dim=0)
+            mask[x.shape[1]:] = 0
+        return x, mask
 
 
 """
@@ -631,193 +699,224 @@ args
 parser = argparse.ArgumentParser()
 # io
 # yes you can use parser types like this
-parser.add_argument("--ckpt", type=asspath, required=False)
-parser.add_argument("--output-dir", type=mkpath, default="")
 parser.add_argument("--ul2-ckpt", type=asspath, required=False)
 parser.add_argument("--byt5-ckpt", type=asspath, required=False)
 parser.add_argument("--metaclip-ckpt", type=asspath, required=False)
 parser.add_argument("--tae-ckpt", type=asspath, required=False)
+parser.add_argument("--output-dir", type=mkpath, default="")
+parser.add_argument("--train-dir", type=asspath, default="dev/data/train-smol")
+parser.add_argument("--val-dir", type=asspath, default="dev/data/val-smol")
+
+# checkpointing
+parser.add_argument("--ckpt", type=asspath, required=False)
+parser.add_argument("--ckpt-from-ldm", type=int, default=0, choices=[0, 1])
+parser.add_argument("--resume", type=int, default=0, choices=[0, 1])
+parser.add_argument("--ckpt-freq", type=int, default=-1)
+parser.add_argument("--device", type=str, default="cuda")
+
 # optimization
 parser.add_argument("--lr", type=float, default=1e-5)
 parser.add_argument("--weight-decay", type=float, default=0.0)
-parser.add_argument("--grad_clip", type=float, default=1.0)
-parser.add_argument("--fps", type=int, default=16)
+parser.add_argument("--grad-clip", type=float, default=1.0)
 parser.add_argument("--batch-size", type=int, default=1)
-parser.add_argument("--total-batch-size", type=int, default=1)
-parser.add_argument("--sequence-length", type=int, default=64)
+parser.add_argument("--max-frames", type=int, default=32)
+parser.add_argument("--resolution", type=int, default=64)
 
 parser.add_argument("--num-iterations", type=int, default=10)
 parser.add_argument("--val-loss-every", type=int, default=0)
 parser.add_argument("--val-max-steps", type=int, default=20)
-parser.add_argument("--overfit-batch", default=False, action="store_true")
+parser.add_argument("--overfit-batch", default=1, type=int)
+
+parser.add_argument("--inference-only", default=0, type=int, choices=[0, 1])
+parser.add_argument("--verbose-loss", default=0, type=int, choices=[0, 1])
+parser.add_argument("--seed", default=420, type=int)
+
 # memory management
-parser.add_argument("--dtype", type=str, default="bfloat16")
-parser.add_argument("--compile", default=False, action="store_true")
+parser.add_argument("--dtype", type=str, default="float32")
+parser.add_argument("--compile", default=0, type=int)
 
 
 if __name__ == "__main__":
+    signal.signal(signal.SIGINT, signal_handler)
     args = parser.parse_args()
     # args error checking
-    assert args.dtype in {"float32", "float16", "bfloat16"}
+    assert args.dtype in {"float32"}
 
-    def get_lr(it):
-        min_lr = args.learning_rate * args.learning_rate_decay_frac
-        # 1) linear warmup for warmup_iters steps
-        if it < args.warmup_iters:
-            return args.learning_rate * (it+1) / args.warmup_iters
-        # 2) if it > lr_decay_iters, return min learning rate
-        if it > args.num_iterations:
-            return min_lr
-        # 3) in between, use cosine decay down to min learning rate
-        decay_ratio = (it - args.warmup_iters) / \
-            (args.num_iterations - args.warmup_iters)
-        assert 0 <= decay_ratio <= 1
-        # coeff starts at 1 and goes to 0
-        coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
-        return min_lr + coeff * (args.learning_rate - min_lr)
-
-    logfile = None
+    train_logfile, val_logfile = None, None
     if args.output_dir:
-        logfile = args.output_dir / "main.log"
+        train_logfile = args.output_dir / "train.log"
+        val_logfile = args.output_dir / "val.log"
+        if args.resume == 0:
+            open(train_logfile, 'w').close()
+            open(val_logfile, 'w').close()
 
     ddp = int(os.environ.get('RANK', -1)) != -1  # is this a ddp run?
     if ddp:
-        assert torch.cuda.is_available()
+        assert torch.cuda.is_available(), "We need CUDA for DDP"
         init_process_group(backend='nccl')
         ddp_rank = int(os.environ['RANK'])
         ddp_local_rank = int(os.environ['LOCAL_RANK'])
         ddp_world_size = int(os.environ['WORLD_SIZE'])
-        device = torch.device(f'cuda:{ddp_local_rank}')
+        device = f'cuda:{ddp_local_rank}'
         torch.cuda.set_device(device)
         master_process = ddp_rank == 0
-        seed_offset = 0  # each process gets the exact same seed
-        zero_stage = args.zero_stage
     else:
         ddp_rank = 0
         ddp_local_rank = 0
-        zero_stage = 0
         ddp_world_size = 1
         master_process = True
-        seed_offset = 0
-        device = torch.device("cuda")
+        device = torch.device(args.device)
 
-    B, T = args.batch_size, args.sequence_length
-    tokens_per_fwdbwd = B * T * ddp_world_size
-    assert args.total_batch_size % tokens_per_fwdbwd == 0
-    grad_accum_steps = args.total_batch_size // tokens_per_fwdbwd
-
-    # set up a context manager following the desired dtype and device
-    ptdtype = {'float32': torch.float32,
-               'bfloat16': torch.bfloat16,
-               'float16': torch.float16}[args.dtype]
-    ctx = torch.amp.autocast(device_type="cuda", dtype=ptdtype)
-
-    torch.manual_seed(420)
+    torch.manual_seed(args.seed)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed(420)
+        torch.cuda.manual_seed(args.seed)
 
     config = MovieGenConfig()
     model = MovieGen(config)
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel()
+                           for p in model.parameters() if p.requires_grad)
+    print0(f"Total Parameters: {total_params:,}")
+    print0(f"Trainable Parameters: {trainable_params:,}")
+    if args.ckpt:
+        ignore_keys = list()
+        # The checkpoint from LDM needs to ignore certain layers
+        if args.ckpt_from_ldm == 1:
+            ignore_keys = [
+                "encoder.conv_out",
+                "decoder.conv_in",
+                "quant_conv",
+                "post_quant_conv",
+            ]
+
+        # if args.resume == 0:
+        #     ignore_keys.append("loss")
+
+        model.from_pretrained(args.ckpt, ignore_keys=ignore_keys)
+
+    model.train()
     if args.compile:
         model = torch.compile(model)
+    model.to(device)
 
-    train_loader = ...
-    val_loader = ...
+    trainset = Dataset(args.train_dir, T=args.max_frames, size=args.resolution)
+    valset = Dataset(args.val_dir, T=args.max_frames,
+                     size=args.resolution, train=False)
+    train_sampler = DistributedSampler(trainset, shuffle=True) if ddp else None
+    val_sampler = DistributedSampler(valset) if ddp else None
+    train_loader = DataLoader(trainset, shuffle=(train_sampler is None),
+                                   num_workers=4, sampler=train_sampler)
+    val_loader = DataLoader(valset, shuffle=False,
+                            num_workers=4, sampler=val_sampler)
 
     if ddp:
-        model = DDP(model, device_ids=[ddp_local_rank])
-    raw_model = model.module if ddp else model
-    optimizer = model.configure_optimizers(lr=args.lr,
-                                           weight_decay=args.weight_decay,
-                                           betas=(0.9, 0.95),
-                                           device_type=device)
+        model = DDP(model, device_ids=[ddp_local_rank],
+                    find_unused_parameters=True)
+    unwrapped_model = model.module if ddp else model
+
+    optimizer = unwrapped_model.configure_optimizers(
+        lr=args.lr, weight_decay=args.weight_decay,
+        betas=(0.5, 0.9))
 
     torch.cuda.reset_peak_memory_stats()
     timings = list()
-    for step in range(args.num_iterations + 1):
+    if args.inference_only:
+        print0("Starting inference only.")
+    else:
+        print0("Starting training.")
+
+    start_step = 0
+    if args.resume == 1:
+        start_step = torch.load(args.ckpt)["step"]
+    trainset_size = len(trainset) // ddp_world_size if ddp else len(trainset)
+    for step in range(start_step, args.num_iterations + 1):
+        if step % trainset_size == 0:
+            train_sampler.set_epoch(step % len(trainset))
+            train_iter = iter(train_loader)
         t0 = time.time()
         last_step = (step == args.num_iterations - 1)
 
         # once in a while evaluate the validation dataset
-        if (args.val_loss_every > 0
-                and (step % args.val_loss_every == 0 or last_step)) \
-                and (val_loader is not None):
+        if ((args.val_loss_every > 0 and step % args.val_loss_every == 0) or last_step or args.inference_only) and (val_loader is not None) and master_process:  # noqa
             model.eval()
-            val_loader.reset()
             with torch.no_grad():
                 val_loss = 0.
-                for _ in range(args.val_max_steps):
-                    x, y = val_loader.next_batch()
-                    x, y = x.to(device), y.to(device)
-                    _, loss = model(x, y, return_logits=False)
+                for vali, (x, mask) in enumerate(val_loader):
+                    if vali >= args.val_max_steps:
+                        break
+                    x, mask = x.to(device), mask.to(device)
+                    loss, loss_dict = model(x, mask, "val", 1, step)
                     val_loss += loss.item()
+                    metrics = None
                 val_loss /= args.val_max_steps
             # log to console and to file
             print0(f"val loss {val_loss}")
-            if master_process and logfile is not None:
-                with open(logfile, "a") as f:
-                    f.write("s:%d vl:%f\n" % (step, val_loss))
+            metrics = {k: np.mean(v) for k, v in metrics.items()}
+            x = " | ".join([f'{x}: {y:.4f}' for x, y in metrics.items()])
+            print0(f" val metrics: {x}")
+            if args.verbose_loss:
+                x = " | ".join([f'{x}: {y.item():.4f}' for x, y in loss_dict.items()])  # noqa
+                print0(f"    val verbose loss: {x}")
+            if val_logfile is not None:
+                with open(val_logfile, "a") as f:
+                    f.write(f"{step},")
+                    f.write(f"val/loss,{val_loss},")
+                    f.write(",".join([f'{x},{y.item():.4f}' for x, y in loss_dict.items()]))  # noqa
+                    f.write("\n")
+                    f.write(",".join([f'{x},{y:.4f}' for x, y in metrics.items()]))  # noqa
+                    f.write("\n")
 
-        if last_step:
+        if last_step or args.inference_only:
             break
 
-        # --------------- TRAINING SECTION BEGIN -----------------
         model.train()
+        # --------------- TRAINING SECTION BEGIN -----------------
         optimizer.zero_grad(set_to_none=True)
-        if args.overfit_single_batch:
-            train_loader.reset()
 
-        lossf = 0.
-        for micro_step in range(grad_accum_steps):
-            # fetch a batch
-            x, y = train_loader.next_batch()
-            x, y = x.to(device), y.to(device)
-
-            if ddp:
-                model.require_backward_grad_sync = (
-                    micro_step == grad_accum_steps - 1)
-            # forward pass
-            with ctx:
-                _, loss = model(x, y, return_logits=False)
-                loss = loss / grad_accum_steps
-                lossf += loss.detach()  # keep track of the mean loss
-            loss.backward()
-        if ddp:
-            dist.all_reduce(lossf, op=dist.ReduceOp.AVG)
-        lossf = lossf.item()
+        # fetch a batch
+        x, mask = next(train_iter)
+        x, mask = x.to(device), mask.to(device)
+        loss, loss_dict = model(x, mask, step)
+        loss.backward()
+        # if ddp:
+        #     dist.all_reduce(loss, op=dist.ReduceOp.AVG)
         norm = torch.nn.utils.clip_grad_norm_(
             model.parameters(), args.grad_clip)
-        lr = get_lr(step)
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = lr
         # step the optimizer
         optimizer.step()
-        # --------------- TRAINING SECTION END -------------------
 
         torch.cuda.synchronize()
         t1 = time.time()
-        tokens_per_second = \
-            grad_accum_steps * ddp_world_size * B * T / (t1 - t0)
         print0(f"""step {step+1:4d}/{args.num_iterations} | \
-               train loss {lossf:.6f} | \
+               train loss {loss.item():.6f} | \
                norm {norm:.4f} | \
-               lr {lr:.2e} | \
-               ({(t1-t0)*1000:.2f} ms | {tokens_per_second:.0f} tok/s) \
                """)
-        if master_process and logfile is not None:
-            with open(logfile, "a") as f:
-                f.write("s:%d tl:%f\n" % (step, lossf))
+        if args.verbose_loss:
+            x = " | ".join([f'{x}: {y.item():.4f}' for x, y in loss_dict.items()])  # noqa
+            print0(f"    verbose loss: {x}")
+        if master_process and train_logfile is not None:
+            with open(train_logfile, "a") as f:
+                f.write(f"{step},")
+                f.write(f"train/loss,{loss.item()},")
+                f.write(",".join([f'{x},{y.item():.4f}' for x, y in loss_dict.items()]))  # noqa
+                f.write("\n")
 
         # keep track of smooth timings, last 20 iterations
         if step > 0 and step > args.num_iterations - 20:
             timings.append(t1 - t0)
+
+        if master_process and step > 0 and args.ckpt_freq > 0 and step % args.ckpt_freq == 0:
+            torch.save({"step": step, "state_dict": unwrapped_model.state_dict()},
+                       args.output_dir / f"tae_{step}.ckpt")
 
     # print the average of the last 20 timings, to get something smooth-ish
     timings = timings[-20:]
     print0(f"final {len(timings)} iters avg: {np.mean(timings)*1000:.3f}ms")
     print0(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")  # NOQA
 
+    if master_process:
+        torch.save({"step": step, "state_dict": model.state_dict()},
+                   args.output_dir / "tae_last.ckpt")
+
+    cleanup()
     # -------------------------------------------------------------------------
-    # clean up nice
-    if ddp:
-        destroy_process_group()

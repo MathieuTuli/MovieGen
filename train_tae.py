@@ -365,9 +365,10 @@ if __name__ == "__main__":
         if master_process and train_logfile is not None:
             with open(train_logfile, "a") as f:
                 f.write(f"{step},")
-                f.write(f"train/toss_ae,{loss_ae.item()},")
-                f.write(f"train/toss_disc,{loss_disc.item()}")
+                f.write(f"train/loss_ae,{loss_ae.item()},")
+                f.write(f"train/loss_disc,{loss_disc.item()},")
                 f.write(",".join([f'{x},{y.item():.4f}' for x, y in loss_dict_ae.items()]))  # noqa
+                f.write(",")
                 f.write(",".join([f'{x},{y.item():.4f}' for x, y in loss_dict_disc.items()]))  # noqa
                 f.write("\n")
 
