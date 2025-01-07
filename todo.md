@@ -13,15 +13,17 @@ TODOs for MovieGen implementation
 - [x] copy baselines
 - [x] weight loading
 - [x] implement the basic map/concat pipeline they use
+- [ ] fine tune MetaCLIP on longer text captions  (77 to 256 context length)
+- [ ] character-level ByT5 encoder is only used to encode visual text, i.e., the part of the text prompt that may explicitly ask for a character string to be generated in the output.
 
 # TAE
 - [x] validate training working
-- [ ] batch multi-frame masking for loss
+- [x] batch multi-frame masking for loss
 - [ ] build inference pipeline
 - [x] validate outlier penalty loss which handles spots
     - it produces odd results to be honest, introducing even more artifacts for me, needs more investigation
     - it's working, but the weight needs to be tuned different from the paper
-- [ ] resume training
+- [x] resume training
     - ~save opt state~
     - save loss state
     - log state
@@ -31,6 +33,11 @@ TODOs for MovieGen implementation
 # MovieGen
 - [ ] build training pipeline
 - [ ] build inference pipeline
+- [ ] controlling fps: preprend "FPS-16"
+    - pre-training, use default fps, prepended in prompt
+    - in fine-tuning, resample to 16 or 24
+- [ ] Bias is honestly randomly set to true or false in many places
+    - e.g. conv in patchifier
 
 # Optimizations
 - [ ] my dtypes are just plopped in and not considered, revisit

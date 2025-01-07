@@ -6,6 +6,7 @@ References:
 """
 from typing import Tuple, Optional
 from dataclasses import dataclass
+from inspect import isfunction
 from pathlib import Path
 
 import argparse
@@ -19,7 +20,7 @@ import os
 from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn import functional as F
-from einops import rearrange
+from einops import rearrange, repeat
 from torch import einsum
 from PIL import Image
 
@@ -32,15 +33,6 @@ import cv2
 
 from text_encoder import TextEncoder, TextEncoderConfig
 from tae import TAE, TAEConfig
-
-# NOQA TODO: dim issues for sure, need to test: particularly the cross attention I just plopped in there
-# NOQA TODO: conv3d patchifier also is naively wrote in from first paper reading: needs review
-# NOQA DONE: need to add the rest of the TAE augs for time inflation and weight loading
-# NOQA TODO: review all REVISIT tags
-# NOQA TODO: dataloader also empty, fill that
-# NOQA TODO: DDP is copied naively from llm.c - confirm
-# NOQA TODO: shard text/vae probably (other parallels from paper maybe?)
-# NOQA DONE: refactor to enable pre-train tae - or keep in same file? idk
 
 """
 -------------------------------------------------------------------------------
@@ -118,6 +110,20 @@ def linear_quadratic_t_schedule(a: float = 0.,
 
 def euler_sampler():
     pass
+
+
+def exists(val):
+    return val is not None
+
+
+def uniq(arr):
+    return {el: True for el in arr}.keys()
+
+
+def default(val, d):
+    if exists(val):
+        return val
+    return d() if isfunction(d) else d
 
 
 """
@@ -209,214 +215,56 @@ class RMSNorm(torch.nn.Module):
         return output * self.weight
 
 
-class BidirectionalSelfAttention(nn.Module):
+class CrossAttention(nn.Module):
     """
-    source: https://github.com/karpathy/llm.c
-        - Copy of the Causal attention without the masking basically
+    pulled from https://github.com/facebookresearch/DiT
     """
 
-    def __init__(self, config):
+    def __init__(self, query_dim,
+                 context_dim=None,
+                 heads=8,
+                 dim_head=64, dropout=0.):
         super().__init__()
-        assert config.n_embd % config.n_head == 0
-
-        self.n_head = config.n_head
-        self.n_kv_head = config.n_kv_head
-        self.n_rep = self.n_head // self.n_kv_head
-        self.hd = config.n_embd // config.n_head
-        self.use_kv = config.use_kv
-        self.flash = config.flash
-
-        # key, query, value projections
-        self.c_attn = nn.Linear(config.n_embd,
-                                (config.n_head + 2 * config.n_kv_head)
-                                * self.hd, bias=False)
-        self.c_proj = nn.Linear(
-            config.n_embd, config.n_embd, bias=False)  # output projection
-
-        # static KV cache:
-        # we could allocate it outside model and pass it in but we don't
-        if self.use_kv:
-            self.cache_k = torch.zeros((
-                config.max_gen_batch_size, config.block_size,
-                config.n_kv_head, self.hd))
-            self.cache_v = torch.zeros((
-                config.max_gen_batch_size, config.block_size,
-                config.n_kv_head, self.hd))
-
-    def forward(self, x, freqs_cis=None, start_pos=None, mask=None):
-        assert mask is None
-        # batch size, sequence length, embedding dimensionality (n_embd)
-        B, T, C = x.size()
-        # calculate query, key, values for all heads in batch
-        # & move head forward to be the batch dim
-        qkv = self.c_attn(x)
-        q, k, v = qkv.split([self.n_head * self.hd,
-                             self.n_kv_head * self.hd,
-                             self.n_kv_head * self.hd], dim=-1)
-        q, k, v = map(lambda t: t.view(B, T, -1, self.hd),
-                      (q, k, v))  # (B, T, NH, HD)
-
-        # rotate QK (rope)  <-- 1. difference compared to GPT-2
-        q, k = apply_rotary_emb(q, k, freqs_cis=freqs_cis)
-
-        # use kv-caching during inference
-        if self.use_kv and not self.training and start_pos >= 0:
-            self.cache_k[:B, start_pos: start_pos + T] = k
-            self.cache_v[:B, start_pos: start_pos + T] = v
-            k = self.cache_k[:B, : start_pos + T]
-            v = self.cache_v[:B, : start_pos + T]
-
-        k = repeat_kv(k, self.n_rep)  # GQA <-- 2. difference compared to GPT-2
-        v = repeat_kv(v, self.n_rep)
-
-        q, k, v = map(lambda t: t.transpose(1, 2), (q, k, v))  # (B, NH, T, HD)
-
-        if self.flash:
-            # flashattention
-            # if T == 1 no need to mask, otherwise the function complains
-            # scaled_dot_product_attention expects a mask where value of True
-            # indicates that the element should take part in attention
-            # our mask is the opposite, so we need to invert it
-            y = F.scaled_dot_product_attention(
-                q, k, v, mask == 0 if T > 1 else None)
-        else:
-            # manual implementation of attention
-            # this materializes the large (T,T) matrix for all queries and keys
-            scores = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.hd))
-            if mask is not None:
-                scores.masked_fill_(mask, torch.finfo(scores.dtype).min)
-            att = F.softmax(scores.float(), dim=-1).type_as(q)
-            y = att @ v  # (B, NH, T, T) x (B, NH, T, HD) -> (B, NH, T, HD)
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
-        y = self.c_proj(y)
-        return y
-
-
-class BidirectionalCrossAttention(nn.Module):
-    """
-    # NOQA source: https://github.com/lucidrains/bidirectional-cross-attention/tree/main
-    """
-
-    def __init__(
-        self,
-        *,
-        dim,
-        heads=8,
-        dim_head=64,
-        context_dim=None,
-        dropout=0.,
-        talking_heads=False,
-        prenorm=False
-    ):
-        super().__init__()
-        context_dim = context_dim or dim
-
-        self.norm = nn.LayerNorm(dim) if prenorm else nn.Identity()
-        self.context_norm = nn.LayerNorm(
-            context_dim) if prenorm else nn.Identity()
-
-        self.heads = heads
-        self.scale = dim_head ** -0.5
         inner_dim = dim_head * heads
+        context_dim = context_dim if context_dim is not None else query_dim
 
-        self.dropout = nn.Dropout(dropout)
-        self.context_dropout = nn.Dropout(dropout)
+        self.scale = dim_head ** -0.5
+        self.heads = heads
 
-        self.to_qk = nn.Linear(dim, inner_dim, bias=False)
-        self.context_to_qk = nn.Linear(context_dim, inner_dim, bias=False)
+        self.to_q = nn.Linear(query_dim, inner_dim, bias=False)
+        self.to_k = nn.Linear(context_dim, inner_dim, bias=False)
+        self.to_v = nn.Linear(context_dim, inner_dim, bias=False)
 
-        self.to_v = nn.Linear(dim, inner_dim, bias=False)
-        self.context_to_v = nn.Linear(context_dim, inner_dim, bias=False)
+        self.to_out = nn.Sequential(
+            nn.Linear(inner_dim, query_dim),
+            nn.Dropout(dropout)
+        )
 
-        self.to_out = nn.Linear(inner_dim, dim)
-        self.context_to_out = nn.Linear(inner_dim, context_dim)
+    def forward(self, x, context=None, mask=None):
+        h = self.heads
 
-        self.talking_heads = nn.Conv2d(
-            heads, heads, 1, bias=False) if talking_heads else nn.Identity()
-        self.context_talking_heads = nn.Conv2d(
-            heads, heads, 1, bias=False) if talking_heads else nn.Identity()
+        q = self.to_q(x)
+        context = default(context, x)
+        k = self.to_k(context)
+        v = self.to_v(context)
 
-    def forward(
-            self,
-            x,
-            context,
-            mask=None,
-            context_mask=None,
-            return_attn=False,
-            rel_pos_bias=None):
-        b, i, j, h, device = \
-            x.shape[0], x.shape[-2], context.shape[-2], self.heads, x.device
+        q, k, v = map(lambda t: rearrange(
+            t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
 
-        x = self.norm(x)
-        context = self.context_norm(context)
+        sim = einsum('b i d, b j d -> b i j', q, k) * self.scale
 
-        # get shared query/keys and values for sequence and context
+        if exists(mask):
+            mask = rearrange(mask, 'b ... -> b (...)')
+            max_neg_value = -torch.finfo(sim.dtype).max
+            mask = repeat(mask, 'b j -> (b h) () j', h=h)
+            sim.masked_fill_(~mask, max_neg_value)
 
-        qk, v = self.to_qk(x), self.to_v(x)
-        context_qk, context_v = self.context_to_qk(
-            context), self.context_to_v(context)
-
-        # split out head
-
-        qk, context_qk, v, context_v = map(lambda t: rearrange(
-            t, 'b n (h d) -> b h n d', h=h), (qk, context_qk, v, context_v))
-
-        # get similarities
-
-        sim = einsum('b h i d, b h j d -> b h i j',
-                     qk, context_qk) * self.scale
-
-        # relative positional bias, if supplied
-
-        if rel_pos_bias is not None:
-            sim = sim + rel_pos_bias
-
-        # mask
-
-        if mask is not None or context_mask is not None:
-            mask = mask or torch.ones(
-                (b, i), device=device, dtype=torch.bool)
-            context_mask = context_mask or torch.ones(
-                (b, j), device=device, dtype=torch.bool)
-
-            attn_mask = rearrange(mask, 'b i -> b 1 i 1') * \
-                rearrange(context_mask, 'b j -> b 1 1 j')
-            sim = sim.masked_fill(~attn_mask, -torch.finfo(sim.dtype).max)
-
-        # get attention along both sequence len and context len dimensions
-        # shared similarity matrix
-
+        # attention, what we cannot get enough of
         attn = sim.softmax(dim=-1)
-        context_attn = sim.softmax(dim=-2)
 
-        # dropouts
-
-        attn = self.dropout(attn)
-        context_attn = self.context_dropout(context_attn)
-
-        # talking heads
-
-        attn = self.talking_heads(attn)
-        context_attn = self.context_talking_heads(context_attn)
-
-        # src sequence aggregates values from context,
-        # context aggregates values from src sequence
-
-        out = einsum('b h i j, b h j d -> b h i d', attn, context_v)
-        context_out = einsum('b h j i, b h j d -> b h i d', context_attn, v)
-
-        # merge heads and combine out
-
-        out, context_out = map(lambda t: rearrange(
-            t, 'b h n d -> b n (h d)'), (out, context_out))
-
-        out = self.to_out(out)
-        context_out = self.context_to_out(context_out)
-
-        if return_attn:
-            return out, context_out, attn, context_attn
-
-        return out, context_out
+        out = einsum('b i j, b j d -> b i d', attn, v)
+        out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
+        return self.to_out(out)
 
 
 class MLP(nn.Module):
@@ -440,21 +288,30 @@ class Block(nn.Module):
     def __init__(self, config):
         # REVISIT: where does the adaptive layer norm for t go?
         super().__init__()
-        self.ln_1 = RMSNorm(config.n_embd, config.norm_eps)
+        self.rmsnorm1 = RMSNorm(config.n_embd, config.norm_eps)
         # REVISIT: Check this bi self attention naively
-        self.attn = BidirectionalSelfAttention(config)
-        self.ln_2 = RMSNorm(config.n_embd, config.norm_eps)
+        self.attn = CrossAttention(query_dim=config.n_embd,
+                                   heads=config.n_head,
+                                   dim_head=config.dim_head,
+                                   dropout=config.dropout)
+        self.rmsnorm2 = RMSNorm(config.n_embd, config.norm_eps)
         # REVISIT: Check this cross attention added naively
-        self.bd_cross_attn = BidirectionalCrossAttention(
-            dim=config.n_embd, heads=config.n_head,
-            dim_head=config.dim_head)
+        self.cross_attn = CrossAttention(query_dim=config.n_embd,
+                                         context_dim=config.n_embd,
+                                         heads=config.n_head,
+                                         dim_head=config.dim_head,
+                                         dropout=config.dropout)
         # REVISIT: should be another norm here
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(config.n_embd, 6 * config.n_embd, bias=True)
+        )
         self.mlp = MLP(config)
 
     def forward(self, x, ctx, freqs_cis=None, start_pos=None, mask=None):
-        x = x + self.attn(self.ln_1(x), freqs_cis, start_pos, mask)
-        x = self.bd_cross_attn(x, ctx)
-        x = x + self.mlp(self.ln_2(x))
+        x = x + self.attn(self.rmsnorm1(x))
+        x = self.cross_attn(x, ctx)
+        x = x + self.mlp(self.rmsnorm2(x))
         return x
 
 
@@ -491,6 +348,20 @@ class MovieGenConfig:
                 setattr(self, k, v)
 
 
+class Patchifier(nn.Module):
+    def __init__(self, config: MovieGenConfig):
+        super().__init__()
+        self.conv = nn.Conv3d(in_channels=config.in_channels,
+                              out_channels=config.n_embd,
+                              kernel_size=config.patch_k,
+                              stride=config.patch_k,
+                              bias=True)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = torch.flatten(x, start_dim=1)
+        return x
+
 class MovieGen(nn.Module):
     def __init__(self,
                  config: MovieGenConfig,
@@ -502,10 +373,6 @@ class MovieGen(nn.Module):
         self.text_encoder = TextEncoder(TextEncoderConfig())
         self.tae = TAE(TAEConfig())
 
-        self.patchifier = nn.Conv3d(in_channels=config.in_channels,
-                                    out_channels=config.n_embd,
-                                    kernel_size=config.patch_k,
-                                    stride=config.patch_k)
         self.transformer = nn.ModuleDict(dict(
             # REVISIT: wte=nn.Embedding(config.vocab_size, config.n_embd),
             h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
@@ -599,11 +466,9 @@ class MovieGen(nn.Module):
         x = self.patchifier(x)
         # REVISIT:
         # pos = self.pos_embd(x)
-        x = torch.flatten(x, start_dim=1)
 
-        freqs_cis = self.freqs_cis[start_pos:start_pos+t]
         for i, block in enumerate(self.transformer.h):
-            x = block(x, ctx, freqs_cis, start_pos)
+            x = block(x, ctx)
         x = self.transformer.ln_f(x)
 
         x = self.tae.decode(x)
@@ -805,7 +670,7 @@ if __name__ == "__main__":
     train_sampler = DistributedSampler(trainset, shuffle=True) if ddp else None
     val_sampler = DistributedSampler(valset) if ddp else None
     train_loader = DataLoader(trainset, shuffle=(train_sampler is None),
-                                   num_workers=4, sampler=train_sampler)
+                              num_workers=4, sampler=train_sampler)
     val_loader = DataLoader(valset, shuffle=False,
                             num_workers=4, sampler=val_sampler)
 
