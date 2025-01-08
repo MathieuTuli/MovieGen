@@ -38,6 +38,10 @@ TODOs for MovieGen implementation
     - in fine-tuning, resample to 16 or 24
 - [ ] Bias is honestly randomly set to true or false in many places
     - e.g. conv in patchifier
+- [ ] arbitrary resolutions/aspect ratios : currently forcing 256x256
+    - Currently, the patchifier/flattening assumes 256x256 inputs, with padded/masked frames
+    - For arbitrary resolutions/aspect ratios/frames, the code will need to be updated
+- [ ] token dropout?
 
 # Optimizations
 - [ ] my dtypes are just plopped in and not considered, revisit

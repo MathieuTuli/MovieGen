@@ -10,7 +10,6 @@ import gzip
 import ftfy
 import html
 import math
-import os
 
 from transformers import T5EncoderModel, AutoTokenizer
 

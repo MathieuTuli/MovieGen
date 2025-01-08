@@ -126,72 +126,8 @@ def default(val, d):
     return d() if isfunction(d) else d
 
 
-"""
--------------------------------------------------------------------------------
-RoPE related
--------------------------------------------------------------------------------
-"""
-
-
-def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
-    ndim = x.ndim
-    assert 0 <= 1 < ndim
-    assert freqs_cis.shape == (x.shape[1], x.shape[-1])
-    shape = [d if i == 1 or i == ndim -
-             1 else 1 for i, d in enumerate(x.shape)]
-    return freqs_cis.view(*shape)
-
-
-def apply_scaling(freqs: torch.Tensor):
-    # Values obtained from grid search
-    scale_factor = 8
-    low_freq_factor = 1
-    high_freq_factor = 4
-    old_context_len = 6144  # original moviegen length
-
-    low_freq_wavelen = old_context_len / low_freq_factor
-    high_freq_wavelen = old_context_len / high_freq_factor
-    new_freqs = []
-    for freq in freqs:
-        wavelen = 2 * math.pi / freq
-        if wavelen < high_freq_wavelen:
-            new_freqs.append(freq)
-        elif wavelen > low_freq_wavelen:
-            new_freqs.append(freq / scale_factor)
-        else:
-            assert low_freq_wavelen != high_freq_wavelen
-            smooth = (old_context_len / wavelen - low_freq_factor) / (
-                high_freq_factor - low_freq_factor
-            )
-            new_freqs.append((1 - smooth) * freq /
-                             scale_factor + smooth * freq)
-    return torch.tensor(new_freqs, dtype=freqs.dtype, device=freqs.device)
-
-
-def precompute_freqs_cis(
-    dim: int, end: int, theta: float = 10000.0, use_scaled: bool = False
-):
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)
-                   [: (dim // 2)].float() / dim))
-    t = torch.arange(end, device=freqs.device, dtype=torch.float32)
-    if use_scaled:
-        freqs = apply_scaling(freqs)
-    freqs = torch.outer(t, freqs)
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
-    return freqs_cis
-
-
-def apply_rotary_emb(
-    xq: torch.Tensor,
-    xk: torch.Tensor,
-    freqs_cis: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
-    xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-    freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
-    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
-    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
-    return xq_out.type_as(xq), xk_out.type_as(xk)
+def modulate(x, shift, scale):
+    return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
 
 """
@@ -275,7 +211,8 @@ class MLP(nn.Module):
         self.c_proj = nn.Linear(config.ffn_dim, config.n_embd, bias=False)
 
     def forward(self, x):
-        # REVISIT: SwiGLU self.c_proj(F.silu(self.c_fc2(x)) * self.c_fc(x))  <-- 3.
+        # REVISIT:uses SwiGLU
+        # SwiGLU self.c_proj(F.silu(self.c_fc2(x)) * self.c_fc(x))
         x1 = self.c_fc(x)
         x2 = self.c_fc2(x)
         x2 = F.silu(x2)
@@ -286,32 +223,60 @@ class MLP(nn.Module):
 
 class Block(nn.Module):
     def __init__(self, config):
-        # REVISIT: where does the adaptive layer norm for t go?
         super().__init__()
+
         self.rmsnorm1 = RMSNorm(config.n_embd, config.norm_eps)
-        # REVISIT: Check this bi self attention naively
         self.attn = CrossAttention(query_dim=config.n_embd,
                                    heads=config.n_head,
                                    dim_head=config.dim_head,
                                    dropout=config.dropout)
         self.rmsnorm2 = RMSNorm(config.n_embd, config.norm_eps)
-        # REVISIT: Check this cross attention added naively
         self.cross_attn = CrossAttention(query_dim=config.n_embd,
                                          context_dim=config.n_embd,
                                          heads=config.n_head,
                                          dim_head=config.dim_head,
                                          dropout=config.dropout)
-        # REVISIT: should be another norm here
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
             nn.Linear(config.n_embd, 6 * config.n_embd, bias=True)
         )
         self.mlp = MLP(config)
 
-    def forward(self, x, ctx, freqs_cis=None, start_pos=None, mask=None):
-        x = x + self.attn(self.rmsnorm1(x))
-        x = self.cross_attn(x, ctx)
-        x = x + self.mlp(self.rmsnorm2(x))
+    def forward(self, x, ctx, t, pos_emb):
+        # get adaln scale/shift
+        shift_1, scale_1, alpha_1, shift_2, scale_2, alpha_2 = \
+            self.adaLN_modulation(t).chunk(6, dim=1)
+        x = x + pos_emb
+        x = x + scale_1 * self.attn(modulate(self.rmsnorm1(x),
+                                             shift_1, scale_1))
+        x = x + self.cross_attn(x, ctx)
+        x = x + scale_2 * self.mlp(modulate(self.rmsnorm2(x),
+                                            shift_2, scale_2))
+        return x
+
+
+class Head(nn.Module):
+    """
+    The final layer of MovieGen
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        self.norm = RMSNorm(config.n_embd, config.norm_eps)
+        self.linear = nn.Linear(config.n_embed,
+                                config.in_channels,
+                                bias=True)
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(config.n_embed, 2 * config.n_embed, bias=True)
+        )
+
+    def forward(self, x, c):
+        # in: [B, ctx_len, 6144]
+        shift, scale = self.adaLN_modulation(c).chunk(2, dim=1)
+        x = modulate(self.norm_final(x), shift, scale)
+        x = self.linear(x)
+        # out: [B, ctx_len, in_channels=16]
         return x
 
 
@@ -325,22 +290,23 @@ models
 @dataclass
 class MovieGenConfig:
     version: str = "1.0"
-    block_size: int = 8192
-    in_channels: int = 64
-    vocab_size: int = ...
+    in_channels: int = 16
     n_layer: int = 48
     n_head: int = 48
-    dim_head: int = 128  # REVISIT: or 96?
+    dim_head: int = 128
     n_embd: int = 6144
     ffn_dim: int = 16384  # 6144 * 4 * 2/3
-    multiple_of: int = 1024
-    norm_eps: float = 1e-5
-    rope_theta: float = 500000.0
-    use_scaled_rope: bool = True
-    max_gen_batch_size: int = 4
-    use_kv: bool = True
-    flash: bool = False  # use flashattention?
+    context_len: int = 8192  # (256 * 256 * 256) / [(8 * 8 * 8) * (1 * 2 * 2)]
+    max_frames: int = 256
+    spatial_resolution: int = 256
     patch_k: Tuple[int, int, int] = (1, 2, 2)
+    norm_eps: float = 1e-5
+    # use kv cache?
+    # - max_gen_batch_size: int = 4
+    # - block_size: int = 8192
+    # - use_kv: bool = False
+    # use flashattention?
+    # flash: bool = False
 
     def __init__(self, **kwargs):
         for k, v in kwargs.items():
@@ -348,46 +314,51 @@ class MovieGenConfig:
                 setattr(self, k, v)
 
 
-class Patchifier(nn.Module):
-    def __init__(self, config: MovieGenConfig):
-        super().__init__()
-        self.conv = nn.Conv3d(in_channels=config.in_channels,
-                              out_channels=config.n_embd,
-                              kernel_size=config.patch_k,
-                              stride=config.patch_k,
-                              bias=True)
-
-    def forward(self, x):
-        x = self.conv(x)
-        x = torch.flatten(x, start_dim=1)
-        return x
-
 class MovieGen(nn.Module):
     def __init__(self,
                  config: MovieGenConfig,
                  ):
         super().__init__()
+        assert config.context_len == (
+                (config.max_frames * config.spatial_resolution ** 2) /
+                (8 ** 3) * np.prod(config.patch_k),
+                "Context length is wrong.")
         self.config = config
+
+        self.patchifier = nn.Conv3d(in_channels=config.in_channels,
+                                    out_channels=config.n_embd,
+                                    kernel_size=config.patch_k,
+                                    stride=config.patch_k,
+                                    bias=True)
+        self.patch_proj = nn.Sequential(
+            nn.LayerNorm(config.in_channels),
+            nn.Linear(config.in_channels, config.n_embd),
+            nn.LayerNorm(config.n_embd),
+        )
+        # NOTE: 8-compression from TAE
+        self.pos_embed_h = nn.Parameter(torch.randn(
+            config.spatial_resolution / (8 * config.patch_k[1]),
+            config.n_embd))
+        self.pos_embed_w = nn.Parameter(torch.randn(
+            config.spatial_resolution / (8 * config.patch_k[2]),
+            config.n_embd))
+        self.pos_embed_t = nn.Parameter(torch.randn(
+            config.max_frames / (8 * config.patch_k[0]),
+            config.n_embd))
 
         # auxilary models
         self.text_encoder = TextEncoder(TextEncoderConfig())
         self.tae = TAE(TAEConfig())
 
         self.transformer = nn.ModuleDict(dict(
-            # REVISIT: wte=nn.Embedding(config.vocab_size, config.n_embd),
             h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f=RMSNorm(config.n_embd, config.norm_eps),
         ))
+        self.head = Head(config)
+        # I borrow the lm head from DiT instead of the Llama head
 
         # init all weights, use a torch rng object to be very careful
         self.init_rng = torch.Generator()
         self.init_rng.manual_seed(420)
-
-        self.freqs_cis = precompute_freqs_cis(
-            config.n_embd // config.n_head,
-            config.block_size * 2,
-            config.rope_theta,
-            config.use_scaled_rope,)
 
     @classmethod
     def initialize_auxiliary_models(self,
@@ -456,40 +427,99 @@ class MovieGen(nn.Module):
             optim_groups, lr=lr, betas=betas, fused=use_fused)
         return optimizer
 
-    def forward(self, x, prompt,
-                targets=None, return_logits=True, start_pos=0):
-        _, t = x.size()  # REVISIT: from llama3, needs to be updated
-        ctx = self.text_encoder(prompt)
-        x = self.tae.encode(x)
-        # REVISIT: does this need permuting?
-        # x = x.permute(0, 2, 1, 3, 4)
-        x = self.patchifier(x)
-        # REVISIT:
-        # pos = self.pos_embd(x)
+    def unpatchify(self, x):
+        """
+        x: (N, T, prod(patch_k) * C)
+        imgs: (N, H, W, C)
+        """
+        c = self.out_channels
+        p = self.x_embedder.patch_size[0]
+        h = w = int(x.shape[1] ** 0.5)
+        assert h * w == x.shape[1]
 
+        x = x.reshape(shape=(x.shape[0], h, w, p, p, c))
+        x = torch.einsum('nhwpqc->nchpwq', x)
+        imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
+        return imgs
+
+    def forward(self, x, prompt, t, mask, targets=None):
+        ctx = self.text_encoder(prompt)
+        x = self.tae.encode(x)  # [B, T, C, H, W]
+        B, T, C, H, W = x.shape
+        x = x.permute(0, 2, 1, 3, 4)  # [B, C, T, H, W]
+        x = self.patchifier(x)
+        x = torch.flatten(x, start_dim=2).permute(0, 2, 1)  # [B, T*H*W, C]
+        # note that T*H*W is the max seq length, since we pad
+        x = self.patch_proj(x)  # [B, T*H*W, 6144]
+
+        # NOTE: Positional Embedding
+        # - hardcoded resolution, for now - see 'revisit' above
+        assert (H < self.config.max_spatial_seq_len and
+                W < self.config.max_spatial_seq_len and
+                T < self.config.max_temporal_seq_len)
+        pos = torch.stack(torch.meshgrid((
+            torch.arange(H, device=x.device),
+            torch.arange(W, device=x.device)
+        ), indexing='ij'), dim=-1)
+        # this is a [num patches x spatial res (x, y)] tensor
+        pos = rearrange(pos, 'h w c -> (h w) c')
+        pos = repeat(pos, 'n d -> b n d', b=B)
+        # these are now [B, num patches]
+        h_indices, w_indices = pos.unbind(dim=-1)
+        # these are [B, num patches, dim]
+        # expand dims for time dimension to be [B, 1, num patches, dim]
+        pos_h = self.pos_embed_h[h_indices]
+        pos_w = self.pos_embed_w[w_indices]
+
+        t_indices = torch.arange(T,  # self.config.max_temporal_seq_len,
+                                 device=x.device)
+        t_indices = repeat(t_indices, 'n -> b n', b=x.shape[0]).unsqueze
+        pos_t = self.pos_embed_t[t_indices]
+        # todo: need to pad patches and roll the time dimesion into the
+        # representation
+        # basically, repeat the spatial dimension max_T times
+        # and for the time emd, repeat is hxw times, but spaced
+        # [B, num patches, dim] +
+        # [B, num patches, dim] +
+        # [B, T          , dim]
+
+        # REVISIT: pad to the max seq length
+        # the thing is, the dataloader already pads at the batch level
+        # this will pad the remaining tokens, up to context len
+        # I might want to aggregate the padding logic to one spot
+        pad_len = self.config.context_len - x.shape[1]
+        x = F.pad(x, (0, 0, 0, pad_len))
+        pos_t = torch.repeat_interleave(pos_h, pos_h.shape[1], dim=1)
+        pos_t = F.pad(pos_h, (0, 0, 0, pad_len))
+        pos_h = repeat(pos_h, 'b n d -> b (n t) d', t=T)
+        pos_h = F.pad(pos_h, (0, 0, 0, pad_len))
+        pos_w = repeat(pos_w, 'b n d -> b (n t) d', t=T)
+        pos_w = F.pad(pos_w, (0, 0, 0, pad_len))
+        assert (pos_h.shape[1] == x.shape[1] and
+                pos_h.shape[1] == pos_w.shape[1] and
+                pos_h.shape[1] == pos_t.shape[1]), \
+            "Pos emb and inputs don't match shape"
+
+        pos_emb = pos_h + pos_w + pos_t
         for i, block in enumerate(self.transformer.h):
-            x = block(x, ctx)
-        x = self.transformer.ln_f(x)
+            x = block(x, ctx, t, pos_emb)
+
+        x = self.head(x)  # [B, ctx_len, in_channels=16]
+        x = x.permute(0, 2, 1).reshape(
+                B, self.config.in_channels,
+                self.config.max_frames,
+                self.config.spatial_resolution,
+                self.config.spatial_resolution).permute(0, 2, 1, 3, 4)
 
         x = self.tae.decode(x)
 
         if targets is not None:
-            # if we are given some desired targets also calculate the loss
-            logits = self.lm_head(x).float()
-            loss = F.cross_entropy(
-                logits.view(
-                    -1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            raise NotImplementedError
+            loss = None
         else:
-            # inference-time mini-optimization: only forward the lm_head
-            # on the very last position
-            # note: using list [-1] to preserve the time dim
-            logits = self.lm_head(x[:, [-1], :]).float()
             loss = None
 
-        if not return_logits:
-            logits = None
-
-        return logits, loss
+        return x, loss
 
 
 """
