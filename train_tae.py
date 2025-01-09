@@ -234,7 +234,7 @@ if __name__ == "__main__":
     train_sampler = DistributedSampler(trainset, shuffle=True) if ddp else None
     val_sampler = DistributedSampler(valset) if ddp else None
     train_loader = DataLoader(trainset, shuffle=(train_sampler is None),
-                                   num_workers=4, sampler=train_sampler)
+                              num_workers=4, sampler=train_sampler)
     val_loader = DataLoader(valset, shuffle=False,
                             num_workers=4, sampler=val_sampler)
 
@@ -260,8 +260,9 @@ if __name__ == "__main__":
     trainset_size = len(trainset) // ddp_world_size if ddp else len(trainset)
     for step in range(start_step, args.num_iterations + 1):
         if step % trainset_size == 0:
-            train_sampler.set_epoch(step % len(trainset))
             train_iter = iter(train_loader)
+            if train_sampler is not None:
+                train_sampler.set_epoch(step % len(trainset))
         t0 = time.time()
         last_step = (step == args.num_iterations - 1)
 

@@ -284,8 +284,7 @@ class TemporalAttention(nn.Module):
                                        stride=1,
                                        padding=0)
 
-    def forward(self, x):
-        return x
+    def forward(self, x, mask=None):
         # REVISIT: confirm attention shapes
         h_ = x
         B, T, C, H, W = h_.shape
@@ -501,6 +500,7 @@ class TemporalEncoder(nn.Module):
         hs = hs.view(B * H * W, C, T)
         hs = self.temp_conv_in(hs)
         _, C, T = hs.shape
+        # back to [B, T, C, H, W]
         hs = [hs.view(B, H, W, C, T).permute(0, 4, 3, 1, 2).contiguous()]
         for i_level in range(self.num_resolutions):
             for i_block in range(self.num_res_blocks):
