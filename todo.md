@@ -29,6 +29,9 @@ TODOs for MovieGen implementation
     - log state
 - [ ] improve logging
     - right now it just dumps to a file, which is fine just clean the dump
+- [x] Temporal Attention is current shortcutted
+    - need to implement
+- [ ] mask attention
 
 # MovieGen
 - [ ] build training pipeline
@@ -42,6 +45,7 @@ TODOs for MovieGen implementation
     - Currently, the patchifier/flattening assumes 256x256 inputs, with padded/masked frames
     - For arbitrary resolutions/aspect ratios/frames, the code will need to be updated
 - [ ] token dropout?
+- [ ] mask attention
 
 # Optimizations
 - [ ] my dtypes are just plopped in and not considered, revisit
