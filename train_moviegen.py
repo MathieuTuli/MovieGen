@@ -13,8 +13,8 @@ import argparse
 import inspect
 import random
 import signal
-import time
 import math
+import time
 import os
 
 from torch.distributed import init_process_group, destroy_process_group
@@ -242,14 +242,14 @@ class Block(nn.Module):
         )
         self.mlp = MLP(config)
 
-    def forward(self, x, ctx, t, pos_emb):
+    def forward(self, x, ctx, t, pos_emb, mask=None):
         # get adaln scale/shift
         shift_1, scale_1, alpha_1, shift_2, scale_2, alpha_2 = \
             self.adaLN_modulation(t).chunk(6, dim=1)
         x = x + pos_emb
         x = x + scale_1 * self.attn(modulate(self.rmsnorm1(x),
-                                             shift_1, scale_1))
-        x = x + self.cross_attn(x, ctx)
+                                             shift_1, scale_1), mask=mask)
+        x = x + self.cross_attn(x, ctx, mask=mask)
         x = x + scale_2 * self.mlp(modulate(self.rmsnorm2(x),
                                             shift_2, scale_2))
         return x
@@ -278,6 +278,49 @@ class Head(nn.Module):
         x = self.linear(x)
         # out: [B, ctx_len, in_channels=16]
         return x
+
+
+class TimestepEmbedder(nn.Module):
+    """
+    Copied from DiT
+    Embeds scalar timesteps into vector representations.
+    """
+
+    def __init__(self, hidden_size, frequency_embedding_size=256):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(frequency_embedding_size, hidden_size, bias=True),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size, bias=True),
+        )
+        self.frequency_embedding_size = frequency_embedding_size
+
+    @staticmethod
+    def timestep_embedding(t, dim, max_period=10000):
+        """
+        Create sinusoidal timestep embeddings.
+        :param t: a 1-D Tensor of N indices, one per batch element.
+                          These may be fractional.
+        :param dim: the dimension of the output.
+        :param max_period: controls the minimum frequency of the embeddings.
+        :return: an (N, D) Tensor of positional embeddings.
+        """
+        # https://github.com/openai/glide-text2im/blob/main/glide_text2im/nn.py
+        half = dim // 2
+        freqs = torch.exp(-math.log(max_period) *
+                          torch.arange(start=0, end=half, dtype=torch.float32)
+                          / half).to(device=t.device)
+        args = t[:, None].float() * freqs[None]
+        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        if dim % 2:
+            embedding = torch.cat(
+                [embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+        return embedding
+
+    def forward(self, t):
+        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
+        t_emb = self.mlp(t_freq)
+        return t_emb
 
 
 """
@@ -320,9 +363,9 @@ class MovieGen(nn.Module):
                  ):
         super().__init__()
         assert config.context_len == (
-                (config.max_frames * config.spatial_resolution ** 2) /
-                (8 ** 3) * np.prod(config.patch_k),
-                "Context length is wrong.")
+            (config.max_frames * config.spatial_resolution ** 2) /
+            (8 ** 3) * np.prod(config.patch_k),
+            "Context length is wrong.")
         self.config = config
 
         self.patchifier = nn.Conv3d(in_channels=config.in_channels,
@@ -335,6 +378,7 @@ class MovieGen(nn.Module):
             nn.Linear(config.in_channels, config.n_embd),
             nn.LayerNorm(config.n_embd),
         )
+        self.t_embedder = TimestepEmbedder(config.n_embed)
         # NOTE: 8-compression from TAE
         self.pos_embed_h = nn.Parameter(torch.randn(
             config.spatial_resolution / (8 * config.patch_k[1]),
@@ -501,15 +545,33 @@ class MovieGen(nn.Module):
             "Pos emb and inputs don't match shape"
 
         pos_emb = pos_h + pos_w + pos_t
+        t = self.t_embedder(t)
+        # Original mask is [B, T]
+        # Each mask element corresponds to (256/8/2)^2 = 256 spatial patches
+        # - or (16x16)
+        # First compress temporal dimension by 8 (from TAE)
+        # this ensures that we "round up"
+        mask = mask.view(B, T//8, 8).any(dim=2).float()  # [B, T/8]
+        # Each temporal position expands to 256 spatial positions
+        spatial_per_temporal = (
+                self.config.spatial_resolution // 8 // self.config.patch_k[1] *
+                self.config.spatial_resolution // 8 // self.config.patch_k[2]
+        )
+        # [B, T/8, 256]
+        mask = mask.unsqueeze(-1).repeat(1, 1, spatial_per_temporal)
+        mask = mask.view(B, -1)  # [B, (T/8) * spatial_per_temporal]
+        # Pad to match the context length
+        mask = F.pad(mask, (0, pad_len))  # [B, context_len]
+
         for i, block in enumerate(self.transformer.h):
-            x = block(x, ctx, t, pos_emb)
+            x = block(x, ctx, t, pos_emb, mask=mask)
 
         x = self.head(x)  # [B, ctx_len, in_channels=16]
-        x = x.permute(0, 2, 1).reshape(
-                B, self.config.in_channels,
-                self.config.max_frames,
-                self.config.spatial_resolution,
-                self.config.spatial_resolution).permute(0, 2, 1, 3, 4)
+        x = x.permute(0, 2, 1).view(
+            B, self.config.in_channels,
+            self.config.max_frames,
+            self.config.spatial_resolution,
+            self.config.spatial_resolution).permute(0, 2, 1, 3, 4)
 
         x = self.tae.decode(x)
 

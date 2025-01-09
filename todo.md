@@ -45,7 +45,7 @@ TODOs for MovieGen implementation
     - Currently, the patchifier/flattening assumes 256x256 inputs, with padded/masked frames
     - For arbitrary resolutions/aspect ratios/frames, the code will need to be updated
 - [ ] token dropout?
-- [ ] mask attention
+- [x] mask attention
 
 # Optimizations
 - [ ] my dtypes are just plopped in and not considered, revisit
