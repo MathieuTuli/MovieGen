@@ -31,7 +31,7 @@ TODOs for MovieGen implementation
     - right now it just dumps to a file, which is fine just clean the dump
 - [x] Temporal Attention is current shortcutted
     - need to implement
-- [ ] mask attention
+- [ ] mask attention: is this required? might intro artifacts, seems to work well ish for now
 
 # MovieGen
 - [ ] build training pipeline

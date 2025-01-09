@@ -302,6 +302,11 @@ class TemporalAttention(nn.Module):
         w_ = w_ * (int(c)**(-0.5))
         w_ = torch.nn.functional.softmax(w_, dim=2)
 
+        if mask is not None and False:
+            mask = rearrange(mask, 'b j -> b 1 j')
+            w_ = w_.masked_fill(~mask.to(torch.int),
+                                -torch.finfo(w_.dtype).max)
+
         # attend to values
         w_ = w_.permute(0, 2, 1)   # b,,t (first hw of k, second of q)
         # b, c,hw (hw of q) h_[b,c,j] = sum_i v[b,c,i] w_[b,i,j]
@@ -347,7 +352,7 @@ class AttnBlock(nn.Module):
                                         stride=1,
                                         padding=0)
 
-    def forward(self, x):
+    def forward(self, x, mask=None):
         h_ = x
         B, T, C, H, W = h_.shape
         h_ = h_.view(B * T, C, H, W)
@@ -363,6 +368,12 @@ class AttnBlock(nn.Module):
         k = k.reshape(b, c, h*w)  # b,c,hw
         w_ = torch.bmm(q, k)     # b,hw,hw    w[b,i,j]=sum_c q[b,i,c]k[b,c,j]
         w_ = w_ * (int(c)**(-0.5))
+
+        if mask is not None and False:
+            import pdb; pdb.set_trace()
+            mask = rearrange(mask, 'b j -> b 1 j')
+            w_ = w_.masked_fill(~mask.to(torch.int),
+                                -torch.finfo(w_.dtype).max)
         w_ = torch.nn.functional.softmax(w_, dim=2)
 
         # attend to values
@@ -486,7 +497,7 @@ class TemporalEncoder(nn.Module):
         self.temp_conv_out = TemporalConv1d(
             block_out, block_out, kernel_size=3, stride=1)
 
-    def forward(self, x):
+    def forward(self, x, mask=None):
         # timestep embedding
         temb = None
 
@@ -508,7 +519,7 @@ class TemporalEncoder(nn.Module):
                 if len(self.down[i_level].attn) > 0:
                     # B, T, C, H, W = h.shape
                     # h = h.view(B * T, C, H, W)
-                    h = self.down[i_level].attn[str(i_block)](h)
+                    h = self.down[i_level].attn[str(i_block)](h, mask)
                     # h = h.view(B, T, C, H, W)
                 hs.append(h)
             if i_level != self.num_resolutions-1:
@@ -519,9 +530,9 @@ class TemporalEncoder(nn.Module):
         h = self.mid.block_1(h, temb)
         # B, T, C, H, W = h.shape
         # h = h.view(B * T, C, H, W)
-        h = self.mid.attn_1(h)
+        h = self.mid.attn_1(h, mask)
         # temporal inflation
-        h = self.mid.temp_attn_1(h)
+        h = self.mid.temp_attn_1(h, mask)
         # h = h.view(B, T, C, H, W)
         h = self.mid.block_2(h, temb)
 
@@ -643,7 +654,7 @@ class TemporalDecoder(nn.Module):
         self.temp_conv_out = TemporalConv1d(
             out_ch, out_ch, kernel_size=3, stride=1)
 
-    def forward(self, z):
+    def forward(self, z, mask=None):
         # assert z.shape[1:] == self.z_shape[1:]
         self.last_z_shape = z.shape
 
@@ -666,9 +677,9 @@ class TemporalDecoder(nn.Module):
         h = self.mid.block_1(h, temb)
         # B, T, C, H, W = h.shape
         # h = h.view(B * T, C, H, W)
-        h = self.mid.attn_1(h)
+        h = self.mid.attn_1(h, mask)
         # temporal inflation
-        self.mid.temp_attn_1(h)
+        self.mid.temp_attn_1(h, mask)
         # h = h.view(B, T, C, H, W)
         h = self.mid.block_2(h, temb)
 
@@ -679,7 +690,7 @@ class TemporalDecoder(nn.Module):
                 if len(self.up[i_level].attn) > 0:
                     # B, T, C, H, W = h.shape
                     # h = h.view(B * T, C, H, W)
-                    h = self.up[i_level].attn[str(i_block)](h)
+                    h = self.up[i_level].attn[str(i_block)](h, mask)
                     # h = h.view(B, T, C, H, W)
             if i_level != 0:
                 h = self.up[i_level].upsample(h)
@@ -1388,9 +1399,9 @@ class TAE(nn.Module):
                 f"{type(encoder_posterior)} not yet implemented")
         return self.scale_factor * z
 
-    def encode(self, x):
+    def encode(self, x, mask):
         # temporal accounting
-        x = self.encoder(x)
+        x = self.encoder(x, mask)
         B, T, C, H, W = x.shape
         x = x.view(B * T, C, H, W)
         moments = self.quant_conv(x)
@@ -1399,14 +1410,14 @@ class TAE(nn.Module):
         posterior = DiagonalGaussianDistribution(moments)
         return posterior
 
-    def decode(self, z):
+    def decode(self, z, mask):
         # temporal accounting
         B, T, C, H, W = z.shape
         z = z.view(B * T, C, H, W)
         z = self.post_quant_conv(z)
         _, C, H, W = z.shape
         z = z.view(B, T, C, H, W)
-        dec = self.decoder(z)
+        dec = self.decoder(z, mask)
         # temporal accounting
         return dec
 
@@ -1416,12 +1427,12 @@ class TAE(nn.Module):
                 step: int = 0,
                 sample_posterior=True):
         # temporal accounting
-        posterior = self.encode(inputs)
+        posterior = self.encode(inputs, mask)
         if sample_posterior:
             z = posterior.sample()
         else:
             z = posterior.mode()
-        dec = self.decode(z)
+        dec = self.decode(z, mask)
         # REVISIT: is this needed?
         # Tprime = inputs.shape[1]
         # assert dec.shape[1] >= Tprime
