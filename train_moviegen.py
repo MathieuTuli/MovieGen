@@ -344,6 +344,8 @@ class MovieGenConfig:
     spatial_resolution: int = 256
     patch_k: Tuple[int, int, int] = (1, 2, 2)
     norm_eps: float = 1e-5
+    # flow matching related
+    sig_min: float = 1e-5
     # use kv cache?
     # - max_gen_batch_size: int = 4
     # - block_size: int = 8192
@@ -435,9 +437,6 @@ class MovieGen(nn.Module):
             ul2_ckpt, byt5_ckpt, metaclip_ckpt, tae_ckpt)
         return model
 
-    def loss(self,):
-        ...
-
     def configure_optimizers(self,
                              lr: float,
                              weight_decay: float,
@@ -471,22 +470,18 @@ class MovieGen(nn.Module):
             optim_groups, lr=lr, betas=betas, fused=use_fused)
         return optimizer
 
-    def unpatchify(self, x):
-        """
-        x: (N, T, prod(patch_k) * C)
-        imgs: (N, H, W, C)
-        """
-        c = self.out_channels
-        p = self.x_embedder.patch_size[0]
-        h = w = int(x.shape[1] ** 0.5)
-        assert h * w == x.shape[1]
+    def step(self, x: torch.Tensor, x_1: torch.Tensor, t: torch.Tensor):
+        return t * x_1 + (1 - (1 - self.config.sig_min) * t) * x
 
-        x = x.reshape(shape=(x.shape[0], h, w, p, p, c))
-        x = torch.einsum('nhwpqc->nchpwq', x)
-        imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
-        return imgs
+    def loss(self, v_psi: nn.Module, x_1: torch.Tensor):
+        ...
 
-    def forward(self, x, prompt, t, mask, targets=None):
+    def forward(self,
+                t: torch.Tensor,
+                x: torch.Tensor,
+                prompt: List[str],
+                mask: torch.Tensor,
+                targets=None):
         ctx = self.text_encoder(prompt)
         x = self.tae.encode(x)  # [B, T, C, H, W]
         B, T, C, H, W = x.shape
@@ -575,13 +570,7 @@ class MovieGen(nn.Module):
 
         x = self.tae.decode(x)
 
-        if targets is not None:
-            raise NotImplementedError
-            loss = None
-        else:
-            loss = None
-
-        return x, loss
+        return x
 
 
 """
