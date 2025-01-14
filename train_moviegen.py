@@ -1,10 +1,7 @@
 """
 Reference code for Movie Gen training and inference.
-
-References:
-    # NOQA 1) https://ai.meta.com/static-resource/movie-gen-research-paper/?utm_source=twitter&utm_medium=organic_social&utm_content=thread&utm_campaign=moviegen
 """
-from typing import Tuple, Optional
+from typing import Tuple, Optional, List
 from dataclasses import dataclass
 from inspect import isfunction
 from pathlib import Path
@@ -19,6 +16,8 @@ import os
 
 from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
+from torch.utils.data import DataLoader
 from torch.nn import functional as F
 from einops import rearrange, repeat
 from torch import einsum
@@ -242,10 +241,16 @@ class Block(nn.Module):
         )
         self.mlp = MLP(config)
 
-    def forward(self, x, ctx, t, pos_emb, mask=None):
+    def forward(self,
+                x: torch.Tensor,
+                ctx: torch.Tensor,
+                t_emb: torch.Tensor,
+                pos_emb: torch.Tensor,
+                mask: torch.Tensor = None):
         # get adaln scale/shift
+        # this is how time embedding is included in the model
         shift_1, scale_1, alpha_1, shift_2, scale_2, alpha_2 = \
-            self.adaLN_modulation(t).chunk(6, dim=1)
+            self.adaLN_modulation(t_emb).chunk(6, dim=1)
         x = x + pos_emb
         x = x + scale_1 * self.attn(modulate(self.rmsnorm1(x),
                                              shift_1, scale_1), mask=mask)
@@ -263,12 +268,12 @@ class Head(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.norm = RMSNorm(config.n_embd, config.norm_eps)
-        self.linear = nn.Linear(config.n_embed,
+        self.linear = nn.Linear(config.n_embd,
                                 config.in_channels,
                                 bias=True)
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(config.n_embed, 2 * config.n_embed, bias=True)
+            nn.Linear(config.n_embd, 2 * config.n_embd, bias=True)
         )
 
     def forward(self, x, c):
@@ -325,6 +330,24 @@ class TimestepEmbedder(nn.Module):
 
 """
 -------------------------------------------------------------------------------
+paths
+-------------------------------------------------------------------------------
+"""
+
+
+class OptimalTransportPath:
+    def __init__(self, sig_min: float = 1e-5) -> None:
+        self.sig_min = sig_min
+
+    def sample(self, x1: torch.Tensor, x0: torch.Tensor, t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        t = t.view(-1, 1, 1, 1)
+        xt = x1 * t + (1 - (1 - self.sig_min) * t) * x0
+        vt = x1 - (1 - self.sig_min) * x0
+        return xt, vt
+
+
+"""
+-------------------------------------------------------------------------------
 models
 -------------------------------------------------------------------------------
 """
@@ -344,8 +367,8 @@ class MovieGenConfig:
     spatial_resolution: int = 256
     patch_k: Tuple[int, int, int] = (1, 2, 2)
     norm_eps: float = 1e-5
+    dropout: float = 0.0
     # flow matching related
-    sig_min: float = 1e-5
     # use kv cache?
     # - max_gen_batch_size: int = 4
     # - block_size: int = 8192
@@ -364,10 +387,11 @@ class MovieGen(nn.Module):
                  config: MovieGenConfig,
                  ):
         super().__init__()
-        assert config.context_len == (
-            (config.max_frames * config.spatial_resolution ** 2) /
-            (8 ** 3) * np.prod(config.patch_k),
-            "Context length is wrong.")
+        calc_ctx_len = (config.max_frames * config.spatial_resolution ** 2) //\
+            ((8 ** 3) * np.prod(config.patch_k))
+        assert config.context_len == calc_ctx_len, \
+            f"Context length is wrong. Set to {config.context_len}. " + \
+            f"Should be {calc_ctx_len}"
         self.config = config
 
         self.patchifier = nn.Conv3d(in_channels=config.in_channels,
@@ -380,31 +404,32 @@ class MovieGen(nn.Module):
             nn.Linear(config.in_channels, config.n_embd),
             nn.LayerNorm(config.n_embd),
         )
-        self.t_embedder = TimestepEmbedder(config.n_embed)
+        self.t_embedder = TimestepEmbedder(config.n_embd)
         # NOTE: 8-compression from TAE
         self.pos_embed_h = nn.Parameter(torch.randn(
-            config.spatial_resolution / (8 * config.patch_k[1]),
+            config.spatial_resolution // (8 * config.patch_k[1]),
             config.n_embd))
         self.pos_embed_w = nn.Parameter(torch.randn(
-            config.spatial_resolution / (8 * config.patch_k[2]),
+            config.spatial_resolution // (8 * config.patch_k[2]),
             config.n_embd))
-        self.pos_embed_t = nn.Parameter(torch.randn(
-            config.max_frames / (8 * config.patch_k[0]),
+        self.pos_embed_T = nn.Parameter(torch.randn(
+            config.max_frames // (8 * config.patch_k[0]),
             config.n_embd))
 
-        # auxilary models
-        self.text_encoder = TextEncoder(TextEncoderConfig())
+        print0("Initializing auxiliary models")
+        # self.text_encoder = TextEncoder(TextEncoderConfig())
         self.tae = TAE(TAEConfig())
 
+        print0("Initializing transformer backbone")
         self.transformer = nn.ModuleDict(dict(
             h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
         ))
         self.head = Head(config)
         # I borrow the lm head from DiT instead of the Llama head
 
-        # init all weights, use a torch rng object to be very careful
-        self.init_rng = torch.Generator()
-        self.init_rng.manual_seed(420)
+        # TODO: init all weights, use a torch rng object to be very careful
+        # self.init_rng = torch.Generator()
+        # self.init_rng.manual_seed(420)
 
     @classmethod
     def initialize_auxiliary_models(self,
@@ -416,8 +441,7 @@ class MovieGen(nn.Module):
             self.tae.from_pretrained(tae_ckpt)
 
     @classmethod
-    def from_pretrained(self,
-                        ckpt: Path, ul2_ckpt: Path, byt5_ckpt: Path,
+    def from_pretrained(self, ckpt: Path,
                         metaclip_ckpt: Path, tae_ckpt: Path):
         model_args = MovieGenConfig()
 
@@ -433,8 +457,7 @@ class MovieGen(nn.Module):
         torch.set_default_tensor_type(torch.tensor(
             [], dtype=original_default_type, device="cpu").type())
 
-        self.initialize_auxiliary_models(
-            ul2_ckpt, byt5_ckpt, metaclip_ckpt, tae_ckpt)
+        self.initialize_auxiliary_models(metaclip_ckpt, tae_ckpt)
         return model
 
     def configure_optimizers(self,
@@ -476,14 +499,41 @@ class MovieGen(nn.Module):
     def loss(self, v_psi: nn.Module, x_1: torch.Tensor):
         ...
 
+    def encode_frames(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.tae.encode(x)  # [B, T, C, H, W]
+        return x
+
+    def decode_frames(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.tae.decode(x)
+        return x
+
+    def encode_prompts(self, prompts: List[str]) -> torch.Tensor:
+        tokens = self.text_encoder.tokenixe(prompts, self.text_encoder.device)
+        x = self.text_encoder(tokens)
+        return x
+
     def forward(self,
                 t: torch.Tensor,
                 x: torch.Tensor,
-                prompt: List[str],
-                mask: torch.Tensor,
-                targets=None):
-        ctx = self.text_encoder(prompt)
-        x = self.tae.encode(x)  # [B, T, C, H, W]
+                ctx: torch.Tensor,
+                mask: torch.Tensor,) -> torch.Tensor:
+        """
+        Note that the TAE uses 8x compression and C=16
+        Note that there is conflating 't' representations:
+            - t is the timestep in the flow
+            - T is the frame count
+            - for simplicity, i will only use those notations
+        @parameters
+        - t: torch.Tensor (B,): timestep for flow
+        - x: torch.Tensor (B, T // 8, C, H // 8, W // 8):
+            TAE encoded input frames
+        - ctx: torch.Tensor (B,): context - i.e. prompts from Text Encoders
+        - mask: torch.Tensor (B,): attention/loss mask for padded frames
+
+        @returns
+        - vt: torch.Tensor (B, T // 8, C, H // 8, W // 8)
+            velocity flow prediction latent
+        """
         B, T, C, H, W = x.shape
         x = x.permute(0, 2, 1, 3, 4)  # [B, C, T, H, W]
         x = self.patchifier(x)
@@ -491,8 +541,7 @@ class MovieGen(nn.Module):
         # note that T*H*W is the max seq length, since we pad
         x = self.patch_proj(x)  # [B, T*H*W, 6144]
 
-        # NOTE: Positional Embedding
-        # - hardcoded resolution, for now - see 'revisit' above
+        # pos embeddeding pulled from DiT
         assert (H < self.config.max_spatial_seq_len and
                 W < self.config.max_spatial_seq_len and
                 T < self.config.max_temporal_seq_len)
@@ -510,17 +559,10 @@ class MovieGen(nn.Module):
         pos_h = self.pos_embed_h[h_indices]
         pos_w = self.pos_embed_w[w_indices]
 
-        t_indices = torch.arange(T,  # self.config.max_temporal_seq_len,
+        T_indices = torch.arange(T,  # self.config.max_temporal_seq_len,
                                  device=x.device)
-        t_indices = repeat(t_indices, 'n -> b n', b=x.shape[0]).unsqueze
-        pos_t = self.pos_embed_t[t_indices]
-        # todo: need to pad patches and roll the time dimesion into the
-        # representation
-        # basically, repeat the spatial dimension max_T times
-        # and for the time emd, repeat is hxw times, but spaced
-        # [B, num patches, dim] +
-        # [B, num patches, dim] +
-        # [B, T          , dim]
+        T_indices = repeat(T_indices, 'n -> b n', b=x.shape[0]).unsqueze
+        pos_T = self.pos_embed_T[T_indices]
 
         # REVISIT: pad to the max seq length
         # the thing is, the dataloader already pads at the batch level
@@ -528,19 +570,21 @@ class MovieGen(nn.Module):
         # I might want to aggregate the padding logic to one spot
         pad_len = self.config.context_len - x.shape[1]
         x = F.pad(x, (0, 0, 0, pad_len))
-        pos_t = torch.repeat_interleave(pos_h, pos_h.shape[1], dim=1)
-        pos_t = F.pad(pos_h, (0, 0, 0, pad_len))
+        pos_T = torch.repeat_interleave(pos_T, pos_T.shape[1], dim=1)
+        pos_T = F.pad(pos_T, (0, 0, 0, pad_len))
         pos_h = repeat(pos_h, 'b n d -> b (n t) d', t=T)
         pos_h = F.pad(pos_h, (0, 0, 0, pad_len))
         pos_w = repeat(pos_w, 'b n d -> b (n t) d', t=T)
         pos_w = F.pad(pos_w, (0, 0, 0, pad_len))
         assert (pos_h.shape[1] == x.shape[1] and
                 pos_h.shape[1] == pos_w.shape[1] and
-                pos_h.shape[1] == pos_t.shape[1]), \
+                pos_h.shape[1] == pos_T.shape[1]), \
             "Pos emb and inputs don't match shape"
 
-        pos_emb = pos_h + pos_w + pos_t
-        t = self.t_embedder(t)
+        pos_emb = pos_h + pos_w + pos_T
+        t_emb = self.t_embedder(t)
+
+        # masking operations
         # Original mask is [B, T]
         # Each mask element corresponds to (256/8/2)^2 = 256 spatial patches
         # - or (16x16)
@@ -549,8 +593,8 @@ class MovieGen(nn.Module):
         mask = mask.view(B, T//8, 8).any(dim=2).float()  # [B, T/8]
         # Each temporal position expands to 256 spatial positions
         spatial_per_temporal = (
-                self.config.spatial_resolution // 8 // self.config.patch_k[1] *
-                self.config.spatial_resolution // 8 // self.config.patch_k[2]
+            self.config.spatial_resolution // 8 // self.config.patch_k[1] *
+            self.config.spatial_resolution // 8 // self.config.patch_k[2]
         )
         # [B, T/8, 256]
         mask = mask.unsqueeze(-1).repeat(1, 1, spatial_per_temporal)
@@ -559,7 +603,7 @@ class MovieGen(nn.Module):
         mask = F.pad(mask, (0, pad_len))  # [B, context_len]
 
         for i, block in enumerate(self.transformer.h):
-            x = block(x, ctx, t, pos_emb, mask=mask)
+            x = block(x, ctx, t_emb, pos_emb, mask=mask)
 
         x = self.head(x)  # [B, ctx_len, in_channels=16]
         x = x.permute(0, 2, 1).view(
@@ -567,8 +611,6 @@ class MovieGen(nn.Module):
             self.config.max_frames,
             self.config.spatial_resolution,
             self.config.spatial_resolution).permute(0, 2, 1, 3, 4)
-
-        x = self.tae.decode(x)
 
         return x
 
@@ -633,7 +675,7 @@ class Dataset:
                                        dtype=frame.dtype)
                 x = torch.cat([x, zero_pad], dim=0)
             mask[x.shape[1]:] = 0
-        return x, mask
+        return x, [""] * x.shape[0], mask
 
 
 """
@@ -667,6 +709,7 @@ parser.add_argument("--grad-clip", type=float, default=1.0)
 parser.add_argument("--batch-size", type=int, default=1)
 parser.add_argument("--max-frames", type=int, default=32)
 parser.add_argument("--resolution", type=int, default=64)
+parser.add_argument("--sig-min", type=float, default=1e-5)
 
 parser.add_argument("--num-iterations", type=int, default=10)
 parser.add_argument("--val-loss-every", type=int, default=0)
@@ -724,21 +767,8 @@ if __name__ == "__main__":
                            for p in model.parameters() if p.requires_grad)
     print0(f"Total Parameters: {total_params:,}")
     print0(f"Trainable Parameters: {trainable_params:,}")
-    if args.ckpt:
-        ignore_keys = list()
-        # The checkpoint from LDM needs to ignore certain layers
-        if args.ckpt_from_ldm == 1:
-            ignore_keys = [
-                "encoder.conv_out",
-                "decoder.conv_in",
-                "quant_conv",
-                "post_quant_conv",
-            ]
 
-        # if args.resume == 0:
-        #     ignore_keys.append("loss")
-
-        model.from_pretrained(args.ckpt, ignore_keys=ignore_keys)
+    # TODO: from pretrained loading for aux models also
 
     model.train()
     if args.compile:
@@ -775,6 +805,7 @@ if __name__ == "__main__":
     if args.resume == 1:
         start_step = torch.load(args.ckpt)["step"]
     trainset_size = len(trainset) // ddp_world_size if ddp else len(trainset)
+    path = OptimalTransportPath(sig_min=args.sig_min)
     for step in range(start_step, args.num_iterations + 1):
         if step % trainset_size == 0:
             train_sampler.set_epoch(step % len(trainset))
@@ -782,47 +813,19 @@ if __name__ == "__main__":
         t0 = time.time()
         last_step = (step == args.num_iterations - 1)
 
-        # once in a while evaluate the validation dataset
-        if ((args.val_loss_every > 0 and step % args.val_loss_every == 0) or last_step or args.inference_only) and (val_loader is not None) and master_process:  # noqa
-            model.eval()
-            with torch.no_grad():
-                val_loss = 0.
-                for vali, (x, mask) in enumerate(val_loader):
-                    if vali >= args.val_max_steps:
-                        break
-                    x, mask = x.to(device), mask.to(device)
-                    loss, loss_dict = model(x, mask, "val", 1, step)
-                    val_loss += loss.item()
-                    metrics = None
-                val_loss /= args.val_max_steps
-            # log to console and to file
-            print0(f"val loss {val_loss}")
-            metrics = {k: np.mean(v) for k, v in metrics.items()}
-            x = " | ".join([f'{x}: {y:.4f}' for x, y in metrics.items()])
-            print0(f" val metrics: {x}")
-            if args.verbose_loss:
-                x = " | ".join([f'{x}: {y.item():.4f}' for x, y in loss_dict.items()])  # noqa
-                print0(f"    val verbose loss: {x}")
-            if val_logfile is not None:
-                with open(val_logfile, "a") as f:
-                    f.write(f"{step},")
-                    f.write(f"val/loss,{val_loss},")
-                    f.write(",".join([f'{x},{y.item():.4f}' for x, y in loss_dict.items()]))  # noqa
-                    f.write("\n")
-                    f.write(",".join([f'{x},{y:.4f}' for x, y in metrics.items()]))  # noqa
-                    f.write("\n")
-
-        if last_step or args.inference_only:
-            break
-
         model.train()
         # --------------- TRAINING SECTION BEGIN -----------------
         optimizer.zero_grad(set_to_none=True)
 
         # fetch a batch
-        x, mask = next(train_iter)
+        x, prompts, mask = next(train_iter)
         x, mask = x.to(device), mask.to(device)
-        loss, loss_dict = model(x, mask, step)
+        prompt_embeds = model.encode_prompts(prompts, "cpu").to(device)
+        x1 = model.encode_frames(x)
+        x0 = torch.randn_like(x, device=device)
+        t = torch.rand(x1.shape[0], device=device)
+        xt, vt = path.sample(x1, x0, t)
+        loss = torch.pow(model(t, x, prompt_embeds, mask) - vt, 2).mean()
         loss.backward()
         # if ddp:
         #     dist.all_reduce(loss, op=dist.ReduceOp.AVG)
