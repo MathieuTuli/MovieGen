@@ -417,7 +417,7 @@ class MovieGen(nn.Module):
             config.n_embd))
 
         print0("Initializing auxiliary models")
-        # self.text_encoder = TextEncoder(TextEncoderConfig())
+        self.text_encoder = TextEncoder(TextEncoderConfig())
         self.tae = TAE(TAEConfig())
 
         print0("Initializing transformer backbone")
