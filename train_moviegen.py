@@ -498,12 +498,12 @@ class MovieGen(nn.Module):
     def loss(self, v_psi: nn.Module, x_1: torch.Tensor):
         ...
 
-    def encode_frames(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.tae.encode(x)  # [B, T, C, H, W]
-        return x
+    def encode_frames(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        x = self.tae.encode(x, mask)  # [B, T, C, H, W]
+        return x.sample()
 
-    def decode_frames(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.tae.decode(x)
+    def decode_frames(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        x = self.tae.decode(x, mask)
         return x
 
     def encode_prompts(self, prompts: List[str]) -> torch.Tensor:
@@ -826,8 +826,8 @@ if __name__ == "__main__":
         x, mask = x.to(device), mask.to(device)
         prompt_embeds = text_encoder.tokenize("video", "cpu")
         prompt_embeds = text_encoder(prompt_embeds).to(device)
-        prompt_embeds = prompt_embeds.expand(x.shape[0])
-        x1 = model.encode_frames(x)
+        prompt_embeds = prompt_embeds.expand(x.shape[0], *prompt_embeds.shape)
+        x1 = model.encode_frames(x, mask)
         x0 = torch.randn_like(x, device=device)
         t = torch.rand(x1.shape[0], device=device)
         xt, vt = path.sample(x1, x0, t)

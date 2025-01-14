@@ -25,3 +25,5 @@ def test_forward_all_cpu():
     te = TextEncoder(TextEncoderConfig(models={"byt5", "ul2", "metaclip"}))
     inputs = te.tokenize(["the world is a wonderous place"])
     te(inputs)
+    inputs = te.tokenize(["the world is a wonderous place", "hello world", "sdf"])
+    te(inputs)
