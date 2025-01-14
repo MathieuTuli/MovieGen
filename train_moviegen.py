@@ -357,7 +357,7 @@ models
 class MovieGenConfig:
     version: str = "1.0"
     in_channels: int = 16
-    n_layer: int = 48
+    n_layer: int = 1
     n_head: int = 48
     dim_head: int = 128
     n_embd: int = 6144
@@ -417,8 +417,10 @@ class MovieGen(nn.Module):
             config.n_embd))
 
         print0("Initializing auxiliary models")
-        self.text_encoder = TextEncoder(TextEncoderConfig())
         self.tae = TAE(TAEConfig())
+        self.tae.eval()
+        for p in self.tae.parameters():
+            p.requires_grad_(False)
 
         print0("Initializing transformer backbone")
         self.transformer = nn.ModuleDict(dict(
@@ -463,9 +465,7 @@ class MovieGen(nn.Module):
     def configure_optimizers(self,
                              lr: float,
                              weight_decay: float,
-                             betas: Tuple[float, float],
-                             device_type: torch.device,
-                             zero_stage: int):
+                             betas: Tuple[float, float],):
         # start with all of the candidate parameters
         param_dict = {pn: p for pn, p in self.named_parameters()}
         # filter out those that do not require grad
@@ -485,9 +485,8 @@ class MovieGen(nn.Module):
         print0(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")  # NOQA
         print0(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")  # NOQA
         # Create AdamW optimizer and use the fused version if it is available
-        fused_available = 'fused' in inspect.signature(
+        use_fused = 'fused' in inspect.signature(
             torch.optim.AdamW).parameters
-        use_fused = fused_available and device_type == 'cuda'
         print0(f"using fused AdamW: {use_fused}")
         optimizer = torch.optim.AdamW(
             optim_groups, lr=lr, betas=betas, fused=use_fused)
@@ -675,7 +674,7 @@ class Dataset:
                                        dtype=frame.dtype)
                 x = torch.cat([x, zero_pad], dim=0)
             mask[x.shape[1]:] = 0
-        return x, [""] * x.shape[0], mask
+        return x, ["video"] * x.shape[0], mask
 
 
 """
@@ -773,6 +772,10 @@ if __name__ == "__main__":
     model.train()
     if args.compile:
         model = torch.compile(model)
+    text_encoder = TextEncoder(TextEncoderConfig())
+    text_encoder.eval()
+    for p in text_encoder.parameters():
+        p.requires_grad_(False)
     model.to(device)
 
     trainset = Dataset(args.train_dir, T=args.max_frames, size=args.resolution)
@@ -808,8 +811,9 @@ if __name__ == "__main__":
     path = OptimalTransportPath(sig_min=args.sig_min)
     for step in range(start_step, args.num_iterations + 1):
         if step % trainset_size == 0:
-            train_sampler.set_epoch(step % len(trainset))
             train_iter = iter(train_loader)
+            if train_sampler is not None:
+                train_sampler.set_epoch(step % len(trainset))
         t0 = time.time()
         last_step = (step == args.num_iterations - 1)
 
@@ -820,7 +824,9 @@ if __name__ == "__main__":
         # fetch a batch
         x, prompts, mask = next(train_iter)
         x, mask = x.to(device), mask.to(device)
-        prompt_embeds = model.encode_prompts(prompts, "cpu").to(device)
+        prompt_embeds = text_encoder.tokenize("video", "cpu")
+        prompt_embeds = text_encoder(prompt_embeds).to(device)
+        prompt_embeds = prompt_embeds.expand(x.shape[0])
         x1 = model.encode_frames(x)
         x0 = torch.randn_like(x, device=device)
         t = torch.rand(x1.shape[0], device=device)
