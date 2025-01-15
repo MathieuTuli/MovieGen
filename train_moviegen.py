@@ -339,8 +339,9 @@ class OptimalTransportPath:
     def __init__(self, sig_min: float = 1e-5) -> None:
         self.sig_min = sig_min
 
-    def sample(self, x1: torch.Tensor, x0: torch.Tensor, t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        t = t.view(-1, 1, 1, 1)
+    def sample(self, x1: torch.Tensor, x0: torch.Tensor, t: torch.Tensor
+               ) -> Tuple[torch.Tensor, torch.Tensor]:
+        t = t.expand_as(x1)
         xt = x1 * t + (1 - (1 - self.sig_min) * t) * x0
         vt = x1 - (1 - self.sig_min) * x0
         return xt, vt
@@ -399,11 +400,11 @@ class MovieGen(nn.Module):
                                     kernel_size=config.patch_k,
                                     stride=config.patch_k,
                                     bias=True)
-        self.patch_proj = nn.Sequential(
-            nn.LayerNorm(config.in_channels),
-            nn.Linear(config.in_channels, config.n_embd),
-            nn.LayerNorm(config.n_embd),
-        )
+        # self.patch_proj = nn.Sequential(
+        #     nn.LayerNorm(config.in_channels),
+        #     nn.Linear(config.in_channels, config.n_embd),
+        #     nn.LayerNorm(config.n_embd),
+        # )
         self.t_embedder = TimestepEmbedder(config.n_embd)
         # NOTE: 8-compression from TAE
         self.pos_embed_h = nn.Parameter(torch.randn(
@@ -537,13 +538,12 @@ class MovieGen(nn.Module):
         x = x.permute(0, 2, 1, 3, 4)  # [B, C, T, H, W]
         x = self.patchifier(x)
         x = torch.flatten(x, start_dim=2).permute(0, 2, 1)  # [B, T*H*W, C]
-        # note that T*H*W is the max seq length, since we pad
-        x = self.patch_proj(x)  # [B, T*H*W, 6144]
+        # x = self.patch_proj(x)  # [B, T*H*W, 6144]
 
         # pos embeddeding pulled from DiT
-        assert (H < self.config.max_spatial_seq_len and
-                W < self.config.max_spatial_seq_len and
-                T < self.config.max_temporal_seq_len)
+        assert (H < self.config.spatial_resolution and
+                W < self.config.spatial_resolution and
+                T < self.config.max_frames)
         pos = torch.stack(torch.meshgrid((
             torch.arange(H, device=x.device),
             torch.arange(W, device=x.device)
@@ -560,7 +560,7 @@ class MovieGen(nn.Module):
 
         T_indices = torch.arange(T,  # self.config.max_temporal_seq_len,
                                  device=x.device)
-        T_indices = repeat(T_indices, 'n -> b n', b=x.shape[0]).unsqueze
+        T_indices = repeat(T_indices, 'n -> b n', b=x.shape[0])
         pos_T = self.pos_embed_T[T_indices]
 
         # REVISIT: pad to the max seq length
@@ -578,7 +578,8 @@ class MovieGen(nn.Module):
         assert (pos_h.shape[1] == x.shape[1] and
                 pos_h.shape[1] == pos_w.shape[1] and
                 pos_h.shape[1] == pos_T.shape[1]), \
-            "Pos emb and inputs don't match shape"
+            "Pos emb and inputs don't match shape.\n" + \
+            f"pos_h: {pos_h.shape}, pos_w: {pos_w.shape}, pos_t: {pos_T.shape}"
 
         pos_emb = pos_h + pos_w + pos_T
         t_emb = self.t_embedder(t)
@@ -828,10 +829,11 @@ if __name__ == "__main__":
         prompt_embeds = text_encoder(prompt_embeds).to(device)
         prompt_embeds = prompt_embeds.expand(x.shape[0], *prompt_embeds.shape)
         x1 = model.encode_frames(x, mask)
-        x0 = torch.randn_like(x, device=device)
+        x0 = torch.randn_like(x1, device=device)
         t = torch.rand(x1.shape[0], device=device)
         xt, vt = path.sample(x1, x0, t)
-        loss = torch.pow(model(t, x, prompt_embeds, mask) - vt, 2).mean()
+        v_model = model(t, xt, prompt_embeds, mask)
+        loss = torch.pow(v_model - vt, 2).mean()
         loss.backward()
         # if ddp:
         #     dist.all_reduce(loss, op=dist.ReduceOp.AVG)
