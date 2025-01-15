@@ -1,6 +1,5 @@
 ---
-TODOs for MovieGen implementation
-- I'm working on this on the side of many other threads so I surely will need a reminder of what I was doing as I tackle this in week-chunks
+TODOs for MovieGen implementation - I'm working on this on the side of many other threads so I surely will need a reminder of what I was doing as I tackle this in week-chunks
 ---
 
 # General
@@ -62,3 +61,5 @@ TODOs for MovieGen implementation
 
 # QOL
 - [ ] implement terminal-based logging/chart plotting
+- [ ] replace the `8` with a `compression factor`
+    - similarly, adjust to divide by `patch_k[0]` for time dimension ops

@@ -4,6 +4,7 @@ Reference code for Movie Gen training and inference.
 from typing import Tuple, Optional, List
 from dataclasses import dataclass
 from inspect import isfunction
+from functools import partial
 from pathlib import Path
 
 import argparse
@@ -23,7 +24,7 @@ from einops import rearrange, repeat
 from torch import einsum
 from PIL import Image
 
-# import torch.distributed as dist
+import matplotlib.pyplot as plt
 import torch.nn as nn
 import numpy as np
 import torchvision
@@ -191,7 +192,7 @@ class CrossAttention(nn.Module):
         if exists(mask):
             mask = rearrange(mask, 'b ... -> b (...)')
             max_neg_value = -torch.finfo(sim.dtype).max
-            mask = repeat(mask, 'b j -> (b h) () j', h=h)
+            mask = repeat(mask, 'b j -> (b h) j ()', h=h)
             sim.masked_fill_(~mask, max_neg_value)
 
         # attention, what we cannot get enough of
@@ -252,10 +253,10 @@ class Block(nn.Module):
         shift_1, scale_1, alpha_1, shift_2, scale_2, alpha_2 = \
             self.adaLN_modulation(t_emb).chunk(6, dim=1)
         x = x + pos_emb
-        x = x + scale_1 * self.attn(modulate(self.rmsnorm1(x),
+        x = x + alpha_1 * self.attn(modulate(self.rmsnorm1(x),
                                              shift_1, scale_1), mask=mask)
         x = x + self.cross_attn(x, ctx, mask=mask)
-        x = x + scale_2 * self.mlp(modulate(self.rmsnorm2(x),
+        x = x + alpha_2 * self.mlp(modulate(self.rmsnorm2(x),
                                             shift_2, scale_2))
         return x
 
@@ -269,7 +270,7 @@ class Head(nn.Module):
         super().__init__()
         self.norm = RMSNorm(config.n_embd, config.norm_eps)
         self.linear = nn.Linear(config.n_embd,
-                                config.in_channels,
+                                np.prod(config.patch_k) * config.in_channels,
                                 bias=True)
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
@@ -279,7 +280,7 @@ class Head(nn.Module):
     def forward(self, x, c):
         # in: [B, ctx_len, 6144]
         shift, scale = self.adaLN_modulation(c).chunk(2, dim=1)
-        x = modulate(self.norm_final(x), shift, scale)
+        x = modulate(self.norm(x), shift, scale)
         x = self.linear(x)
         # out: [B, ctx_len, in_channels=16]
         return x
@@ -358,12 +359,12 @@ models
 class MovieGenConfig:
     version: str = "1.0"
     in_channels: int = 16
-    n_layer: int = 1
-    n_head: int = 48
+    n_layer: int = 2  # 48
+    n_head: int = 12  # 48
     dim_head: int = 128
     n_embd: int = 6144
     ffn_dim: int = 16384  # 6144 * 4 * 2/3
-    context_len: int = 8192  # (256 * 256 * 256) / [(8 * 8 * 8) * (1 * 2 * 2)]
+    # context_len: int = 8192  # (256 * 256 * 256) / [(8 * 8 * 8) * (1 * 2 * 2)]
     max_frames: int = 256
     spatial_resolution: int = 256
     patch_k: Tuple[int, int, int] = (1, 2, 2)
@@ -388,11 +389,12 @@ class MovieGen(nn.Module):
                  config: MovieGenConfig,
                  ):
         super().__init__()
-        calc_ctx_len = (config.max_frames * config.spatial_resolution ** 2) //\
+        self.context_len = (
+            config.max_frames * config.spatial_resolution ** 2) //\
             ((8 ** 3) * np.prod(config.patch_k))
-        assert config.context_len == calc_ctx_len, \
-            f"Context length is wrong. Set to {config.context_len}. " + \
-            f"Should be {calc_ctx_len}"
+        # assert config.context_len == calc_ctx_len, \
+        #     f"Context length is wrong. Set to {config.context_len}. " + \
+        #     f"Should be {calc_ctx_len}"
         self.config = config
 
         self.patchifier = nn.Conv3d(in_channels=config.in_channels,
@@ -424,17 +426,43 @@ class MovieGen(nn.Module):
             p.requires_grad_(False)
 
         print0("Initializing transformer backbone")
-        self.transformer = nn.ModuleDict(dict(
-            h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-        ))
+        self.blocks = nn.ModuleList([
+            Block(config) for _ in range(config.n_layer)])
         self.head = Head(config)
         # I borrow the lm head from DiT instead of the Llama head
 
-        # TODO: init all weights, use a torch rng object to be very careful
-        # self.init_rng = torch.Generator()
-        # self.init_rng.manual_seed(420)
+        self.initialize_weights()
 
-    @classmethod
+    def initialize_weights(self):
+        # Initialize transformer layers:
+        def _basic_init(module):
+            if isinstance(module, nn.Linear):
+                torch.nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+        self.apply(_basic_init)
+
+        # Initialize patchifier like nn.Linear (instead of nn.Conv3d):
+        # this is done as in DiT
+        w = self.patchifier.weight.data
+        nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
+        nn.init.constant_(self.patchifier.bias, 0)
+
+        # Initialize timestep embedding MLP:
+        nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
+        nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
+
+        # Zero-out adaLN modulation layers in DiT blocks:
+        for block in self.blocks:
+            nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
+            nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+
+        # Zero-out output layers:
+        nn.init.constant_(self.head.adaLN_modulation[-1].weight, 0)
+        nn.init.constant_(self.head.adaLN_modulation[-1].bias, 0)
+        nn.init.constant_(self.head.linear.weight, 0)
+        nn.init.constant_(self.head.linear.bias, 0)
+
     def initialize_auxiliary_models(self,
                                     metaclip_ckpt: Optional[Path],
                                     tae_ckpt: Optional[Path]):
@@ -475,22 +503,15 @@ class MovieGen(nn.Module):
         # Any parameters that is 2D will be weight decayed, otherwise no.
         # i.e. all weight tensors in matmuls + embeddings decay,
         #   all biases and layernorms don't.
-        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
-        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        # decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        # nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        params = [p for n, p in param_dict.items()]
         optim_groups = [
-            {'params': decay_params, 'weight_decay': weight_decay},
-            {'params': nodecay_params, 'weight_decay': 0.0}
+            {'params': params, 'weight_decay': weight_decay},
+            # {'params': decay_params, 'weight_decay': weight_decay},
+            # {'params': nodecay_params, 'weight_decay': 0.0}
         ]
-        num_decay_params = sum(p.numel() for p in decay_params)
-        num_nodecay_params = sum(p.numel() for p in nodecay_params)
-        print0(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")  # NOQA
-        print0(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")  # NOQA
-        # Create AdamW optimizer and use the fused version if it is available
-        use_fused = 'fused' in inspect.signature(
-            torch.optim.AdamW).parameters
-        print0(f"using fused AdamW: {use_fused}")
-        optimizer = torch.optim.AdamW(
-            optim_groups, lr=lr, betas=betas, fused=use_fused)
+        optimizer = torch.optim.AdamW(optim_groups, lr=lr, betas=betas)
         return optimizer
 
     def step(self, x: torch.Tensor, x_1: torch.Tensor, t: torch.Tensor):
@@ -508,7 +529,7 @@ class MovieGen(nn.Module):
         return x
 
     def encode_prompts(self, prompts: List[str]) -> torch.Tensor:
-        tokens = self.text_encoder.tokenixe(prompts, self.text_encoder.device)
+        tokens = self.text_encoder.tokenize(prompts, self.text_encoder.device)
         x = self.text_encoder(tokens)
         return x
 
@@ -545,16 +566,13 @@ class MovieGen(nn.Module):
                 W < self.config.spatial_resolution and
                 T < self.config.max_frames)
         pos = torch.stack(torch.meshgrid((
-            torch.arange(H, device=x.device),
-            torch.arange(W, device=x.device)
+            torch.arange(H // self.config.patch_k[1], device=x.device),
+            torch.arange(W // self.config.patch_k[2], device=x.device)
         ), indexing='ij'), dim=-1)
-        # this is a [num patches x spatial res (x, y)] tensor
         pos = rearrange(pos, 'h w c -> (h w) c')
         pos = repeat(pos, 'n d -> b n d', b=B)
         # these are now [B, num patches]
         h_indices, w_indices = pos.unbind(dim=-1)
-        # these are [B, num patches, dim]
-        # expand dims for time dimension to be [B, 1, num patches, dim]
         pos_h = self.pos_embed_h[h_indices]
         pos_w = self.pos_embed_w[w_indices]
 
@@ -567,9 +585,11 @@ class MovieGen(nn.Module):
         # the thing is, the dataloader already pads at the batch level
         # this will pad the remaining tokens, up to context len
         # I might want to aggregate the padding logic to one spot
-        pad_len = self.config.context_len - x.shape[1]
+        pad_len = self.context_len - x.shape[1]
         x = F.pad(x, (0, 0, 0, pad_len))
-        pos_T = torch.repeat_interleave(pos_T, pos_T.shape[1], dim=1)
+        # interleave for num patches
+        pad_len = self.context_len - (pos_T.shape[1] * pos_w.shape[1])
+        pos_T = torch.repeat_interleave(pos_T, pos_w.shape[1], dim=1)
         pos_T = F.pad(pos_T, (0, 0, 0, pad_len))
         pos_h = repeat(pos_h, 'b n d -> b (n t) d', t=T)
         pos_h = F.pad(pos_h, (0, 0, 0, pad_len))
@@ -577,7 +597,8 @@ class MovieGen(nn.Module):
         pos_w = F.pad(pos_w, (0, 0, 0, pad_len))
         assert (pos_h.shape[1] == x.shape[1] and
                 pos_h.shape[1] == pos_w.shape[1] and
-                pos_h.shape[1] == pos_T.shape[1]), \
+                pos_h.shape[1] == pos_T.shape[1] and
+                pos_h.shape[1] == self.context_len), \
             "Pos emb and inputs don't match shape.\n" + \
             f"pos_h: {pos_h.shape}, pos_w: {pos_w.shape}, pos_t: {pos_T.shape}"
 
@@ -585,34 +606,38 @@ class MovieGen(nn.Module):
         t_emb = self.t_embedder(t)
 
         # masking operations
-        # Original mask is [B, T]
-        # Each mask element corresponds to (256/8/2)^2 = 256 spatial patches
-        # - or (16x16)
-        # First compress temporal dimension by 8 (from TAE)
-        # this ensures that we "round up"
-        mask = mask.view(B, T//8, 8).any(dim=2).float()  # [B, T/8]
+        # Original mask is [B, T * 8], since T is the latent embedding here
+        # Each mask element corresponds to
+        # (spatial_res/8/2)^2 = 256 spatial patches
+        mask = mask.view(B, T, 8).any(dim=2)  # [B, T/8]
         # Each temporal position expands to 256 spatial positions
         spatial_per_temporal = (
             self.config.spatial_resolution // 8 // self.config.patch_k[1] *
             self.config.spatial_resolution // 8 // self.config.patch_k[2]
         )
-        # [B, T/8, 256]
+        # [B, T, 256]
         mask = mask.unsqueeze(-1).repeat(1, 1, spatial_per_temporal)
-        mask = mask.view(B, -1)  # [B, (T/8) * spatial_per_temporal]
+        mask = mask.view(B, -1)  # [B, T * spatial_per_temporal]
         # Pad to match the context length
         mask = F.pad(mask, (0, pad_len))  # [B, context_len]
+        assert mask.shape[1] == self.context_len
 
-        for i, block in enumerate(self.transformer.h):
+        for i, block in enumerate(self.blocks):
             x = block(x, ctx, t_emb, pos_emb, mask=mask)
 
-        x = self.head(x)  # [B, ctx_len, in_channels=16]
-        x = x.permute(0, 2, 1).view(
-            B, self.config.in_channels,
-            self.config.max_frames,
-            self.config.spatial_resolution,
-            self.config.spatial_resolution).permute(0, 2, 1, 3, 4)
-
-        return x
+        # REVISIT: what is this supposed to be? time emb?
+        x = self.head(x, t_emb)  # [B, ctxlen, patch_h * patch_w * in_channels]
+        x = x.view(B,
+                   self.config.max_frames // 8 // self.config.patch_k[0],
+                   H // self.config.patch_k[1],
+                   W // self.config.patch_k[2],
+                   self.config.patch_k[0],  # this isn't necessary
+                   self.config.patch_k[1],
+                   self.config.patch_k[2],
+                   self.config.in_channels)
+        x = rearrange(x, 'b T H W x y z C -> b (T x) C (H y) (W z)').contiguous()
+        # REVISIT: should I be doing this here
+        return x[:, :T]
 
 
 """
@@ -623,7 +648,7 @@ dataloader
 
 
 class Dataset:
-    def __init__(self, root: Path, T: int, size: int = 64, train: bool = True):
+    def __init__(self, root: Path, T: int, size: int = 256, train: bool = True):
         self.train = train
         self.T = T
         self.files = list()
@@ -653,12 +678,14 @@ class Dataset:
         return x
 
     def __getitem__(self, index):
-        mask = torch.ones([self.T])
+        index = 0
+        mask = torch.ones([self.T], dtype=torch.int)
         video = self.load_video(self.files[index])
         vlen = video.shape[0]
         # 1:3 image/video ratio from paper
         if index % 4 == 0:
             id = random.randint(0, vlen - 1) if self.train else 0
+            id = 0
             frame = video[id]
             zero_pad = torch.zeros(self.T - 1, *frame.shape,
                                    dtype=frame.dtype)
@@ -726,6 +753,7 @@ parser.add_argument("--compile", default=0, type=int)
 
 
 if __name__ == "__main__":
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
     signal.signal(signal.SIGINT, signal_handler)
     args = parser.parse_args()
     # args error checking
@@ -738,6 +766,8 @@ if __name__ == "__main__":
         if args.resume == 0:
             open(train_logfile, 'w').close()
             open(val_logfile, 'w').close()
+    else:
+        args.output_dir = mkpath("tmp")
 
     ddp = int(os.environ.get('RANK', -1)) != -1  # is this a ddp run?
     if ddp:
@@ -761,14 +791,16 @@ if __name__ == "__main__":
         torch.cuda.manual_seed(args.seed)
 
     config = MovieGenConfig()
+    config.spatial_resolution = args.resolution
+    config.max_frames = args.max_frames
     model = MovieGen(config)
+    model.initialize_auxiliary_models(metaclip_ckpt=args.metaclip_ckpt,
+                                      tae_ckpt=args.tae_ckpt)
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel()
                            for p in model.parameters() if p.requires_grad)
     print0(f"Total Parameters: {total_params:,}")
     print0(f"Trainable Parameters: {trainable_params:,}")
-
-    # TODO: from pretrained loading for aux models also
 
     model.train()
     if args.compile:
@@ -797,6 +829,7 @@ if __name__ == "__main__":
     optimizer = unwrapped_model.configure_optimizers(
         lr=args.lr, weight_decay=args.weight_decay,
         betas=(0.5, 0.9))
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=200, gamma=0.1)
 
     torch.cuda.reset_peak_memory_stats()
     timings = list()
@@ -810,7 +843,7 @@ if __name__ == "__main__":
         start_step = torch.load(args.ckpt)["step"]
     trainset_size = len(trainset) // ddp_world_size if ddp else len(trainset)
     path = OptimalTransportPath(sig_min=args.sig_min)
-    for step in range(start_step, args.num_iterations + 1):
+    for step in range(start_step, args.num_iterations):
         if step % trainset_size == 0:
             train_iter = iter(train_loader)
             if train_sampler is not None:
@@ -841,6 +874,7 @@ if __name__ == "__main__":
             model.parameters(), args.grad_clip)
         # step the optimizer
         optimizer.step()
+        scheduler.step()
 
         torch.cuda.synchronize()
         t1 = time.time()
@@ -848,14 +882,10 @@ if __name__ == "__main__":
                train loss {loss.item():.6f} | \
                norm {norm:.4f} | \
                """)
-        if args.verbose_loss:
-            x = " | ".join([f'{x}: {y.item():.4f}' for x, y in loss_dict.items()])  # noqa
-            print0(f"    verbose loss: {x}")
         if master_process and train_logfile is not None:
             with open(train_logfile, "a") as f:
                 f.write(f"{step},")
                 f.write(f"train/loss,{loss.item()},")
-                f.write(",".join([f'{x},{y.item():.4f}' for x, y in loss_dict.items()]))  # noqa
                 f.write("\n")
 
         # keep track of smooth timings, last 20 iterations
@@ -864,7 +894,7 @@ if __name__ == "__main__":
 
         if master_process and step > 0 and args.ckpt_freq > 0 and step % args.ckpt_freq == 0:
             torch.save({"step": step, "state_dict": unwrapped_model.state_dict()},
-                       args.output_dir / f"tae_{step}.ckpt")
+                       args.output_dir / f"moviegen_{step}.ckpt")
 
     # print the average of the last 20 timings, to get something smooth-ish
     timings = timings[-20:]
@@ -873,7 +903,31 @@ if __name__ == "__main__":
 
     if master_process:
         torch.save({"step": step, "state_dict": model.state_dict()},
-                   args.output_dir / "tae_last.ckpt")
+                   args.output_dir / "moviegen_last.ckpt")
+
+        model.eval()
+        with torch.no_grad():
+            # sample using midpoint solver
+            xt = torch.rand(1, 1, 16, 64 // 8, 64 // 8, dtype=torch.float32, device=device)
+            T = torch.linspace(0, 1, 11, device=device)  # sample times
+            prompt_embeds = text_encoder.tokenize("video", "cpu")
+            prompt_embeds = text_encoder(prompt_embeds).to(device)
+            prompt_embeds = prompt_embeds.expand(xt.shape[0], *prompt_embeds.shape)
+            mask = torch.zeros(1, 8, dtype=torch.int, device=device)
+            mask[0] = 1
+            odefunc = partial(model.forward, ctx=prompt_embeds, mask=mask)
+            sol = list()
+            for i in range(10):
+                t_start = T[i].expand(xt.shape[0])
+                t_end = T[i + 1].expand(xt.shape[0])
+                xt = xt + (t_end - t_start)[..., None, None, None] * odefunc(
+                    t=t_start + (t_end - t_start) /
+                    2, x=xt + odefunc(x=xt, t=t_start) * ((t_end - t_start) / 2)[..., None, None, None])
+                sol.append(xt)
+            num_timesteps = len(sol)
+            frames = model.decode_frames(sol[-1], mask)
+            for i, frame in enumerate(frames[0]):
+                torchvision.transforms.ToPILImage()(frame * 0.5 + 0.5).save(args.output_dir / f"final_image_{i}.png")
 
     cleanup()
     # -------------------------------------------------------------------------
