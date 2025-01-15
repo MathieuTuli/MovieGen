@@ -13,7 +13,7 @@ Left is gt, and right is reconstructed, with outlier loss for 10k steps after tr
 
 ![generated gif](./readme-media/before_outlier.gif)
 
-Here's what it's like without outlier loss.
+Here's what it's like without outlier loss: many more artifacts (latent dots?), especially on the left side of the gif.
 
 I'm working on dual 3090s here so this is enough for now to validate the approach works; although  am overfitting so I would like those artifacts to be resolved. But that's a later problem, need to keep momentum for now.
 
