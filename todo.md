@@ -31,9 +31,11 @@ TODOs for MovieGen implementation - I'm working on this on the side of many othe
 - [x] Temporal Attention is current shortcutted
     - need to implement
 - [ ] mask attention: is this required? might intro artifacts, seems to work well ish for now
+- [ ] validate batch size is working - it should be
+    - can one sample be logically chunked into multiple batches? is this even needed?
 
 # MovieGen
-- [ ] build training pipeline
+- [x] build training pipeline
 - [ ] build inference pipeline
 - [ ] controlling fps: preprend "FPS-16"
     - pre-training, use default fps, prepended in prompt
@@ -43,6 +45,7 @@ TODOs for MovieGen implementation - I'm working on this on the side of many othe
 - [ ] arbitrary resolutions/aspect ratios : currently forcing 256x256
     - Currently, the patchifier/flattening assumes 256x256 inputs, with padded/masked frames
     - For arbitrary resolutions/aspect ratios/frames, the code will need to be updated
+    - mainly, I'm using the aboslute fractionalized pe, from navit, but also not padding right: i.e. assuming all inputs are resized to the proper resolution: update this in v2 or something
 - [ ] token dropout?
 - [x] mask attention
 
@@ -50,16 +53,19 @@ TODOs for MovieGen implementation - I'm working on this on the side of many othe
 - [ ] my dtypes are just plopped in and not considered, revisit
 - [ ] `torch.compile` is just plopped from llm.c also, revisit
 - [ ] Model sharding: implement techniques from paper
-- [ ] TAE: DDP loader
-- [ ] MovieGen: DDP loader
+- [x] TAE: DDP loader
+- [x] MovieGen: DDP loader
 - [ ] TAE: efficient inference using temporal tiling
 - [ ] TAE: dataloader loads and discards a video file, could optimize this and use all frames in a video file or something
 - [ ] TAE: grad accum
 - [ ] TAE: optimize multi-processing dataloader
+    - pre process dataset into shards? load dynamically into mem based on avail ram?
+    - [ ] TAE: preprocess dataset and preload chunks like in llm.c
 - [ ] TAE: valset is split from DDP, which shouldn't happen
-- [ ] TAE: preprocess dataset and preload chunks like in llm.c
+    - i forgot what this means
 
 # QOL
 - [ ] implement terminal-based logging/chart plotting
 - [ ] replace the `8` with a `compression factor`
     - similarly, adjust to divide by `patch_k[0]` for time dimension ops
+- [ ] logging after resume, connect to previous logs
