@@ -1,3 +1,4 @@
+from dataclasses import asdict
 from pathlib import Path
 
 import argparse
@@ -7,9 +8,9 @@ import time
 import os
 
 
-from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
+from torch.distributed import init_process_group
 from torch.utils.data import DataLoader
 from PIL import Image
 
@@ -21,6 +22,8 @@ import cv2
 
 from metrics import collect_metrics
 from tae import TAE, TAEConfig
+from util import (
+    dump_dict_to_yaml, asspath, mkpath, print0, cleanup, signal_handler)
 
 
 class Dataset:
@@ -58,7 +61,7 @@ class Dataset:
         video = self.load_video(self.files[index])
         vlen = video.shape[0]
         # 1:3 image/video ratio from paper
-        if index % 4 == 0:
+        if random.random() < 0.25 and self.train:
             id = random.randint(0, vlen - 1) if self.train else 0
             frame = video[id]
             zero_pad = torch.zeros(self.T - 1, *frame.shape,
@@ -81,50 +84,6 @@ class Dataset:
 
 """
 -------------------------------------------------------------------------------
-helpers
--------------------------------------------------------------------------------
-"""
-
-
-def asspath(strarg):
-    """helper to ensure arg path exists"""
-    p = Path(strarg)
-    if p.exists():
-        return p
-    else:
-        raise NotADirectoryError(strarg)
-
-
-def mkpath(strarg):
-    """helper to mkdir arg path if it doesn't exist"""
-    if not strarg:
-        return ""
-    p = Path(strarg)
-    p.mkdir(exist_ok=True, parents=True)
-    return p
-
-
-def print0(*args, **kwargs):
-    """modified print that only prints from the master process"""
-    if int(os.environ.get("RANK", 0)) == 0:
-        print(*args, **kwargs)
-
-
-def cleanup():
-    """Cleanup function to destroy the process group"""
-    if int(os.environ.get('RANK', -1)) != -1:
-        destroy_process_group()
-
-
-def signal_handler(sig, frame):
-    """Handle Ctrl+C gracefully"""
-    print0("\nCtrl+C caught. Cleaning up...")
-    cleanup()
-    exit(0)
-
-
-"""
--------------------------------------------------------------------------------
 args
 -------------------------------------------------------------------------------
 """
@@ -133,8 +92,9 @@ parser = argparse.ArgumentParser()
 # io
 # yes you can use parser types like this
 parser.add_argument("--output-dir", type=mkpath, default="")
-parser.add_argument("--train-dir", type=asspath, default="dev/data/train-smol")
-parser.add_argument("--val-dir", type=asspath, default="dev/data/val-smol")
+parser.add_argument("--train-dir", type=asspath,
+                    default="dev/data/train-overfit")
+parser.add_argument("--val-dir", type=asspath, default="dev/data/val-overfit")
 
 # checkpointing
 parser.add_argument("--ckpt", type=asspath, required=False)
@@ -178,6 +138,8 @@ if __name__ == "__main__":
         if args.resume == 0:
             open(train_logfile, 'w').close()
             open(val_logfile, 'w').close()
+    else:
+        args.output_dir = mkpath("tmp")
 
     ddp = int(os.environ.get('RANK', -1)) != -1  # is this a ddp run?
     if ddp:
@@ -201,6 +163,8 @@ if __name__ == "__main__":
         torch.cuda.manual_seed(args.seed)
 
     config = TAEConfig()
+    config_dict = {'TAEConfig': asdict(config), 'CLIArgs': vars(args)}
+    dump_dict_to_yaml(args.output_dir / "config_dump.yaml", config_dict)
     model = TAE(config)
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel()
@@ -222,6 +186,7 @@ if __name__ == "__main__":
         #     ignore_keys.append("loss")
 
         model.from_pretrained(args.ckpt, ignore_keys=ignore_keys)
+        print0(f"Loaded ckpt {args.ckpt}")
 
     model.train()
     if args.compile:
@@ -233,10 +198,12 @@ if __name__ == "__main__":
                      size=args.resolution, train=False)
     train_sampler = DistributedSampler(trainset, shuffle=True) if ddp else None
     val_sampler = DistributedSampler(valset) if ddp else None
-    train_loader = DataLoader(trainset, shuffle=(train_sampler is None),
+    batch_size = args.batch_size // ddp_world_size
+    train_loader = DataLoader(trainset, batch_size=batch_size,
+                              shuffle=(train_sampler is None),
                               num_workers=4, sampler=train_sampler)
-    val_loader = DataLoader(valset, shuffle=False,
-                            num_workers=4, sampler=val_sampler)
+    val_loader = DataLoader(valset, batch_size=batch_size,
+                            shuffle=False, num_workers=4, sampler=val_sampler)
 
     if ddp:
         model = DDP(model, device_ids=[ddp_local_rank],

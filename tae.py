@@ -285,7 +285,12 @@ class TemporalAttention(nn.Module):
                                        padding=0)
 
     def forward(self, x, mask=None):
-        # REVISIT: confirm attention shapes
+        # REVISIT:
+        # - confirm attention shapes
+        # - skipping to valiate it works
+        # - masking i think is broken
+        return x
+
         h_ = x
         B, T, C, H, W = h_.shape
         h_ = h_.permute(0, 3, 4, 2, 1).contiguous().view(B * H * W, C, T)
@@ -295,7 +300,6 @@ class TemporalAttention(nn.Module):
         v = self.v(h_)
 
         # compute attention
-        # REVISIT: confirm attention shapes
         b, c, t = q.shape
         q = q.permute(0, 2, 1)   # b,t,c
         w_ = torch.bmm(q, k)     # b,t,t   w[b,i,j]=sum_c q[b,i,c]k[b,c,j]
@@ -1315,7 +1319,7 @@ class TAEConfig:
     loss_disc_start: int = 5001
     loss_kl_weight: float = 1e-6
     loss_disc_weight: float = 0.5
-    loss_outlier_weight: float = 1e2
+    loss_outlier_weight: float = 0  # 1e2
     loss_outlier_scaling_factor: float = 3
 
     def __init__(self, **kwargs):

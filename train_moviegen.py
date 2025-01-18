@@ -33,49 +33,8 @@ import cv2
 
 from text_encoder import TextEncoder, TextEncoderConfig
 from tae import TAE, TAEConfig
-
-"""
--------------------------------------------------------------------------------
-helpers
--------------------------------------------------------------------------------
-"""
-
-
-def asspath(strarg):
-    """helper to ensure arg path exists"""
-    p = Path(strarg)
-    if p.exists():
-        return p
-    else:
-        raise NotADirectoryError(strarg)
-
-
-def mkpath(strarg):
-    """helper to mkdir arg path if it doesn't exist"""
-    if not strarg:
-        return ""
-    p = Path(strarg)
-    p.mkdir(exist_ok=True, parents=True)
-    return p
-
-
-def print0(*args, **kwargs):
-    """modified print that only prints from the master process"""
-    if int(os.environ.get("RANK", 0)) == 0:
-        print(*args, **kwargs)
-
-
-def cleanup():
-    """Cleanup function to destroy the process group"""
-    if int(os.environ.get('RANK', -1)) != -1:
-        destroy_process_group()
-
-
-def signal_handler(sig, frame):
-    """Handle Ctrl+C gracefully"""
-    print0("\nCtrl+C caught. Cleaning up...")
-    cleanup()
-    exit(0)
+from util import (
+    dump_dict_to_yaml, asspath, mkpath, print0, cleanup, signal_handler)
 
 
 """
@@ -511,14 +470,12 @@ class MovieGen(nn.Module):
             # {'params': decay_params, 'weight_decay': weight_decay},
             # {'params': nodecay_params, 'weight_decay': 0.0}
         ]
-        optimizer = torch.optim.AdamW(optim_groups, lr=lr, betas=betas)
+        optimizer = torch.optim.AdamW(optim_groups, lr=lr, betas=betas,
+                                      fused=True)
         return optimizer
 
     def step(self, x: torch.Tensor, x_1: torch.Tensor, t: torch.Tensor):
         return t * x_1 + (1 - (1 - self.config.sig_min) * t) * x
-
-    def loss(self, v_psi: nn.Module, x_1: torch.Tensor):
-        ...
 
     def encode_frames(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         x = self.tae.encode(x, mask)  # [B, T, C, H, W]
@@ -635,7 +592,8 @@ class MovieGen(nn.Module):
                    self.config.patch_k[1],
                    self.config.patch_k[2],
                    self.config.in_channels)
-        x = rearrange(x, 'b T H W x y z C -> b (T x) C (H y) (W z)').contiguous()
+        x = rearrange(
+            x, 'b T H W x y z C -> b (T x) C (H y) (W z)').contiguous()
         # REVISIT: should I be doing this here
         return x[:, :T]
 
@@ -648,8 +606,10 @@ dataloader
 
 
 class Dataset:
-    def __init__(self, root: Path, T: int, size: int = 256, train: bool = True):
+    def __init__(self, root: Path, T: int, image_only: bool,
+                 size: int = 256, train: bool = True,):
         self.train = train
+        self.image_only = image_only
         self.T = T
         self.files = list()
         for ext in ('*.mp4', '*.avi', '*.mov', '*.mkv', '*.webm', '*.gif'):
@@ -682,8 +642,7 @@ class Dataset:
         mask = torch.ones([self.T], dtype=torch.int)
         video = self.load_video(self.files[index])
         vlen = video.shape[0]
-        # 1:3 image/video ratio from paper
-        if index % 4 == 0:
+        if self.image_only:
             id = random.randint(0, vlen - 1) if self.train else 0
             id = 0
             frame = video[id]
@@ -737,6 +696,7 @@ parser.add_argument("--batch-size", type=int, default=1)
 parser.add_argument("--max-frames", type=int, default=32)
 parser.add_argument("--resolution", type=int, default=64)
 parser.add_argument("--sig-min", type=float, default=1e-5)
+parser.add_argument("--image-only", type=int, default=0)
 
 parser.add_argument("--num-iterations", type=int, default=10)
 parser.add_argument("--val-loss-every", type=int, default=0)
@@ -811,8 +771,10 @@ if __name__ == "__main__":
         p.requires_grad_(False)
     model.to(device)
 
-    trainset = Dataset(args.train_dir, T=args.max_frames, size=args.resolution)
+    trainset = Dataset(args.train_dir, T=args.max_frames,
+                       image_only=args.image_only, size=args.resolution)
     valset = Dataset(args.val_dir, T=args.max_frames,
+                     image_only=args.image_only,
                      size=args.resolution, train=False)
     train_sampler = DistributedSampler(trainset, shuffle=True) if ddp else None
     val_sampler = DistributedSampler(valset) if ddp else None
@@ -829,7 +791,6 @@ if __name__ == "__main__":
     optimizer = unwrapped_model.configure_optimizers(
         lr=args.lr, weight_decay=args.weight_decay,
         betas=(0.5, 0.9))
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=200, gamma=0.1)
 
     torch.cuda.reset_peak_memory_stats()
     timings = list()
@@ -867,6 +828,10 @@ if __name__ == "__main__":
         xt, vt = path.sample(x1, x0, t)
         v_model = model(t, xt, prompt_embeds, mask)
         loss = torch.pow(v_model - vt, 2).mean()
+        frames = model.decode_frames(x1, mask)
+        for i, frame in enumerate(frames[0]):
+            torchvision.transforms.ToPILImage()(
+                frame * 0.5 + 0.5).save(args.output_dir / f"test_image_{i}.png")
         loss.backward()
         # if ddp:
         #     dist.all_reduce(loss, op=dist.ReduceOp.AVG)
@@ -874,7 +839,6 @@ if __name__ == "__main__":
             model.parameters(), args.grad_clip)
         # step the optimizer
         optimizer.step()
-        scheduler.step()
 
         torch.cuda.synchronize()
         t1 = time.time()
@@ -908,16 +872,18 @@ if __name__ == "__main__":
         model.eval()
         with torch.no_grad():
             # sample using midpoint solver
-            xt = torch.rand(1, 1, 16, 64 // 8, 64 // 8, dtype=torch.float32, device=device)
-            T = torch.linspace(0, 1, 11, device=device)  # sample times
+            xt = torch.rand(1, 1, 16, args.resolution // 8, args.resolution // 8,
+                            dtype=torch.float32, device=device)
+            T = torch.linspace(0, 1, 51, device=device)  # sample times
             prompt_embeds = text_encoder.tokenize("video", "cpu")
             prompt_embeds = text_encoder(prompt_embeds).to(device)
-            prompt_embeds = prompt_embeds.expand(xt.shape[0], *prompt_embeds.shape)
+            prompt_embeds = prompt_embeds.expand(
+                xt.shape[0], *prompt_embeds.shape)
             mask = torch.zeros(1, 8, dtype=torch.int, device=device)
             mask[0] = 1
             odefunc = partial(model.forward, ctx=prompt_embeds, mask=mask)
             sol = list()
-            for i in range(10):
+            for i in range(50):
                 t_start = T[i].expand(xt.shape[0])
                 t_end = T[i + 1].expand(xt.shape[0])
                 xt = xt + (t_end - t_start)[..., None, None, None] * odefunc(
@@ -927,7 +893,7 @@ if __name__ == "__main__":
             num_timesteps = len(sol)
             frames = model.decode_frames(sol[-1], mask)
             for i, frame in enumerate(frames[0]):
-                torchvision.transforms.ToPILImage()(frame * 0.5 + 0.5).save(args.output_dir / f"final_image_{i}.png")
+                torchvision.transforms.ToPILImage()(
+                    frame * 0.5 + 0.5).save(args.output_dir / f"final_image_{i}.png")
 
-    cleanup()
-    # -------------------------------------------------------------------------
+    cleanup()    # -------------------------------------------------------------------------

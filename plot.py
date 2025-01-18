@@ -1,9 +1,14 @@
 import matplotlib.pyplot as plt
 import pandas as pd
 import seaborn as sns
+from argparse import ArgumentParser
+
+parser = ArgumentParser()
+parser.add_argument("--file", type=str, required=True)
 
 if __name__ == "__main__":
     # plt.style.use('seaborn')
+    args = parser.parse_args()
 
     def parse_log_line(line):
         """Parse a single line of the log file into a dictionary"""
@@ -29,7 +34,8 @@ if __name__ == "__main__":
 
 # Read and parse the log file
     data = []
-    with open('tmp/ddp-test-final/train.log', 'r') as f:
+    # with open('v0.1.0/tae-v0.1.1-init-ldm-with-outlier/train.log', 'r') as f:
+    with open(args.file, 'r') as f:
         for line in f:
             if line.strip():
                 data.append(parse_log_line(line))
