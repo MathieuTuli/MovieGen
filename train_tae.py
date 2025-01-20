@@ -5,6 +5,7 @@ import argparse
 import random
 import signal
 import time
+import sys
 import os
 
 
@@ -117,6 +118,8 @@ parser.add_argument("--val-max-steps", type=int, default=20)
 parser.add_argument("--overfit-batch", default=1, type=int)
 
 parser.add_argument("--inference-only", default=0, type=int, choices=[0, 1])
+parser.add_argument("--compute-magic-number", default=0,
+                    type=int, choices=[0, 1])
 parser.add_argument("--verbose-loss", default=0, type=int, choices=[0, 1])
 parser.add_argument("--seed", default=420, type=int)
 
@@ -221,6 +224,54 @@ if __name__ == "__main__":
     else:
         print0("Starting training.")
 
+    if args.compute_magic_number:
+        all_latents = list()
+        with torch.no_grad():
+            for x, mask in train_loader:
+                x, mask = x.to(device), mask.to(device)
+                latents = model.encode(x, mask).sample()
+                all_latents.append(latents.cpu())
+        local_latents = torch.cat(all_latents)
+
+        if ddp:
+            # Get the maximum size across all processes
+            local_size = torch.tensor([local_latents.shape[0]], device=device)
+            all_sizes = [torch.zeros_like(local_size)
+                         for _ in range(ddp_world_size)]
+            torch.distributed.all_gather(all_sizes, local_size)
+            max_size = max(size.item() for size in all_sizes)
+
+            # Pad local_latents to max_size
+            if local_latents.shape[0] < max_size:
+                padding = torch.zeros(max_size - local_latents.shape[0],
+                                      *local_latents.shape[1:],
+                                      dtype=local_latents.dtype,
+                                      device=local_latents.device)
+                local_latents = torch.cat([local_latents, padding])
+
+            # Gather all latents
+            all_gathered = [torch.zeros_like(
+                local_latents) for _ in range(ddp_world_size)]
+            torch.distributed.all_gather(all_gathered, local_latents)
+
+            # On master process, combine and compute stats
+            if master_process:
+                # Remove padding and concatenate
+                all_gathered = [tensor[:size.item()]
+                                for tensor, size in zip(all_gathered,
+                                                        all_sizes)]
+                all_latents_tensor = torch.cat(all_gathered)
+                std = all_latents_tensor.std().item()
+                normalizer = 1 / std
+                print0(f"Magic number: {normalizer=}")
+        else:
+            # Single process case
+            std = local_latents.std().item()
+            normalizer = 1 / std
+            print0(f"Magic number: {normalizer=}")
+        cleanup()
+        sys.exit(0)
+
     start_step = 0
     if args.resume == 1:
         start_step = torch.load(args.ckpt)["step"]
@@ -248,7 +299,7 @@ if __name__ == "__main__":
                     if vali >= args.val_max_steps:
                         break
                     x, mask = x.to(device), mask.to(device)
-                    dec, _, loss, loss_dict = model(x, mask, "val", 1, step)
+                    dec, _, loss, loss_dict = model(x, mask, "val", 1, vali)
                     val_loss += loss.item()
                     metrics = collect_metrics(
                         dec.permute(0, 1, 3, 4, 2).cpu().numpy(),
@@ -263,7 +314,7 @@ if __name__ == "__main__":
                             fn = args.output_dir / f"val_x_{vali}_{b}_{t}.png"
                             torchvision.transforms.ToPILImage()(
                                 (x[b, t] + 1) * 0.5).save(fn)
-                val_loss /= args.val_max_steps
+                val_loss /= vali
             # log to console and to file
             print0(f"val loss {val_loss}")
             metrics = {k: np.mean(v) for k, v in metrics.items()}

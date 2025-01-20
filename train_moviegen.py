@@ -426,29 +426,31 @@ class MovieGen(nn.Module):
                                     metaclip_ckpt: Optional[Path],
                                     tae_ckpt: Optional[Path]):
         if metaclip_ckpt is not None:
+            print0(f"Loaded MetaClip weights from {metaclip_ckpt}.")
             self.text_encoder.from_pretrained(metaclip_ckpt)
         if tae_ckpt is not None:
+            print0(f"Loaded TAE weights from. {tae_ckpt}")
             self.tae.from_pretrained(tae_ckpt)
 
-    @classmethod
-    def from_pretrained(self, ckpt: Path,
-                        metaclip_ckpt: Path, tae_ckpt: Path):
-        model_args = MovieGenConfig()
+    # REVISIT:
+    # @classmethod
+    def from_pretrained(self, ckpt: Path, ignore_keys: List[str] = None,):
+        ignore_keys = ignore_keys or list()
+        sd = torch.load(ckpt, map_location="cpu",
+                        weights_only=False)["state_dict"]
+        keys = list(sd.keys())
+        for k in keys:
+            for ik in ignore_keys:
+                if k.startswith(ik):
+                    print("    - Deleting key {} from state_dict.".format(k))
+                    del sd[k]
 
-        checkpoint = torch.load(ckpt, map_location="cpu")
+        temp_sd = self.state_dict()
+        for k in temp_sd:
+            if "temp_" in k and k not in sd:
+                sd[k] = temp_sd[k]
 
-        # save the default type
-        original_default_type = torch.get_default_dtype()
-        # much faster loading
-        torch.set_default_tensor_type(torch.cuda.BFloat16Tensor)
-        model = MovieGen(model_args)
-        model.load_state_dict(checkpoint, strict=False)
-        # restore type
-        torch.set_default_tensor_type(torch.tensor(
-            [], dtype=original_default_type, device="cpu").type())
-
-        self.initialize_auxiliary_models(metaclip_ckpt, tae_ckpt)
-        return model
+        self.load_state_dict(sd, strict=True)
 
     def configure_optimizers(self,
                              lr: float,
@@ -651,9 +653,9 @@ class Dataset:
             x = torch.cat([frame[None, :], zero_pad], dim=0)
             mask[1:] = 0
         else:
-            id = 0
             if self.train:
                 id = random.randint(0, max(vlen - self.T - 1, 0))
+            id = 0
             x = video[id:id + self.T]
             if x.shape[0] < self.T:
                 zero_pad = torch.zeros(self.T - x.shape[0],
@@ -678,8 +680,9 @@ parser.add_argument("--byt5-ckpt", type=asspath, required=False)
 parser.add_argument("--metaclip-ckpt", type=asspath, required=False)
 parser.add_argument("--tae-ckpt", type=asspath, required=False)
 parser.add_argument("--output-dir", type=mkpath, default="")
-parser.add_argument("--train-dir", type=asspath, default="dev/data/train-smol")
-parser.add_argument("--val-dir", type=asspath, default="dev/data/val-smol")
+parser.add_argument("--train-dir", type=asspath,
+                    default="dev/data/train-overfit")
+parser.add_argument("--val-dir", type=asspath, default="dev/data/val-overfit")
 
 # checkpointing
 parser.add_argument("--ckpt", type=asspath, required=False)
@@ -761,6 +764,9 @@ if __name__ == "__main__":
                            for p in model.parameters() if p.requires_grad)
     print0(f"Total Parameters: {total_params:,}")
     print0(f"Trainable Parameters: {trainable_params:,}")
+    if args.ckpt:
+        model.from_pretrained(args.ckpt)
+        print0(f"Loaded ckpt {args.ckpt}")
 
     model.train()
     if args.compile:
@@ -772,9 +778,9 @@ if __name__ == "__main__":
     model.to(device)
 
     trainset = Dataset(args.train_dir, T=args.max_frames,
-                       image_only=args.image_only, size=args.resolution)
+                       image_only=args.image_only == 1, size=args.resolution)
     valset = Dataset(args.val_dir, T=args.max_frames,
-                     image_only=args.image_only,
+                     image_only=args.image_only == 1,
                      size=args.resolution, train=False)
     train_sampler = DistributedSampler(trainset, shuffle=True) if ddp else None
     val_sampler = DistributedSampler(valset) if ddp else None
@@ -787,7 +793,6 @@ if __name__ == "__main__":
         model = DDP(model, device_ids=[ddp_local_rank],
                     find_unused_parameters=True)
     unwrapped_model = model.module if ddp else model
-
     optimizer = unwrapped_model.configure_optimizers(
         lr=args.lr, weight_decay=args.weight_decay,
         betas=(0.5, 0.9))
@@ -800,20 +805,94 @@ if __name__ == "__main__":
         print0("Starting training.")
 
     start_step = 0
+    best_val_loss = float('inf')
     if args.resume == 1:
-        start_step = torch.load(args.ckpt)["step"]
+        ckpt = torch.load(args.ckpt, weights_only=False)
+        start_step = ckpt["step"]
+        best_val_loss = ckpt.get("best_val_loss", best_val_loss)
+        del ckpt
     trainset_size = len(trainset) // ddp_world_size if ddp else len(trainset)
+    valset_size = len(valset) // ddp_world_size if ddp else len(valset)
     path = OptimalTransportPath(sig_min=args.sig_min)
-    for step in range(start_step, args.num_iterations):
+    for step in range(start_step, args.num_iterations + 1):
         if step % trainset_size == 0:
             train_iter = iter(train_loader)
             if train_sampler is not None:
                 train_sampler.set_epoch(step % len(trainset))
         t0 = time.time()
         last_step = (step == args.num_iterations - 1)
+        if ((args.val_loss_every > 0 and step % args.val_loss_every == 0) or
+            last_step or args.inference_only) and (val_loader is not None) and master_process:  # noqa
+            with torch.no_grad():
+                val_loss = 0.
+                val_iter = iter(val_loader)
+                for vali in range(args.val_max_steps):
+                    try:
+                        x, prompts, mask = next(val_iter)
+                    except StopIteration:
+                        break
+                    x, mask = x.to(device), mask.to(device)
+                    prompt_embeds = text_encoder.tokenize("video", "cpu")
+                    prompt_embeds = text_encoder(prompt_embeds).to(device)
+                    prompt_embeds = prompt_embeds.expand(
+                        x.shape[0], *prompt_embeds.shape)
+                    x1 = model.encode_frames(
+                        x, mask) * model.tae.scaling_factor
+                    x0 = torch.randn_like(x1, device=device)
+                    t = torch.rand(x1.shape[0], device=device)
+                    xt, vt = path.sample(x1, x0, t)
+                    v_model = model(t, xt, prompt_embeds, mask)
+                    loss = torch.pow(v_model - vt, 2).mean()
+                    val_loss += loss.item()
+                    frames = model.decode_frames(
+                        x1 / model.tae.scaling_factor, mask)
+                val_loss /= vali
+            if master_process and val_loss < best_val_loss:
+                best_val_loss = val_loss
+                torch.save({"step": step, "state_dict": model.state_dict(),
+                            "best_val_loss": best_val_loss},
+                           args.output_dir / "moviegen_best.ckpt",)
+            print0(f"val loss {val_loss}")
+            # log to console and to file
+            if val_logfile is not None:
+                with open(val_logfile, "a") as f:
+                    f.write(f"{step},val/loss,{val_loss}\n")
+            with torch.no_grad():
+                # sample using midpoint solver
+                latent_T = 4
+                xt = torch.rand(1, latent_T, config.in_channels,
+                                args.resolution // 8, args.resolution // 8,
+                                dtype=torch.float32, device=device)
+                T = torch.linspace(0, 1, 200, device=device)  # sample times
+                prompt_embeds = text_encoder.tokenize("video", "cpu")
+                prompt_embeds = text_encoder(prompt_embeds).to(device)
+                prompt_embeds = prompt_embeds.expand(
+                    xt.shape[0], *prompt_embeds.shape)
+                mask = torch.ones(1, 8 * latent_T,
+                                  dtype=torch.int, device=device)
+                odefunc = partial(model.forward, ctx=prompt_embeds, mask=mask)
+                sol = list()
+                for i in range(50):
+                    t_start = T[i].expand(xt.shape[0])
+                    t_end = T[i + 1].expand(xt.shape[0])
+                    xt = xt + (t_end - t_start)[..., None, None, None] * \
+                        odefunc(t=t_start + (t_end - t_start) / 2,
+                                x=xt + odefunc(x=xt, t=t_start) * (
+                            (t_end - t_start) / 2)[..., None, None, None])
+                    sol.append(xt)
+                num_timesteps = len(sol)
+                frames = model.decode_frames(
+                    sol[-1] / model.tae.scaling_factor, mask)
+                for i, frame in enumerate(frames[0]):
+                    torchvision.transforms.ToPILImage()(
+                        frame * 0.5 + 0.5).save(
+                        args.output_dir /
+                        f"validation_sample_step_{step}_{i}.png")
+        if last_step or args.inference_only:
+            break
 
-        model.train()
         # --------------- TRAINING SECTION BEGIN -----------------
+        model.train()
         optimizer.zero_grad(set_to_none=True)
 
         # fetch a batch
@@ -822,16 +901,12 @@ if __name__ == "__main__":
         prompt_embeds = text_encoder.tokenize("video", "cpu")
         prompt_embeds = text_encoder(prompt_embeds).to(device)
         prompt_embeds = prompt_embeds.expand(x.shape[0], *prompt_embeds.shape)
-        x1 = model.encode_frames(x, mask)
+        x1 = model.encode_frames(x, mask) * model.tae.scaling_factor
         x0 = torch.randn_like(x1, device=device)
         t = torch.rand(x1.shape[0], device=device)
         xt, vt = path.sample(x1, x0, t)
         v_model = model(t, xt, prompt_embeds, mask)
         loss = torch.pow(v_model - vt, 2).mean()
-        frames = model.decode_frames(x1, mask)
-        for i, frame in enumerate(frames[0]):
-            torchvision.transforms.ToPILImage()(
-                frame * 0.5 + 0.5).save(args.output_dir / f"test_image_{i}.png")
         loss.backward()
         # if ddp:
         #     dist.all_reduce(loss, op=dist.ReduceOp.AVG)
@@ -857,7 +932,8 @@ if __name__ == "__main__":
             timings.append(t1 - t0)
 
         if master_process and step > 0 and args.ckpt_freq > 0 and step % args.ckpt_freq == 0:
-            torch.save({"step": step, "state_dict": unwrapped_model.state_dict()},
+            torch.save({"step": step, "state_dict": model.state_dict(),
+                        "best_val_loss": best_val_loss},
                        args.output_dir / f"moviegen_{step}.ckpt")
 
     # print the average of the last 20 timings, to get something smooth-ish
@@ -866,34 +942,7 @@ if __name__ == "__main__":
     print0(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")  # NOQA
 
     if master_process:
-        torch.save({"step": step, "state_dict": model.state_dict()},
+        torch.save({"step": step, "state_dict": model.state_dict(),
+                    "best_val_loss": best_val_loss},
                    args.output_dir / "moviegen_last.ckpt")
-
-        model.eval()
-        with torch.no_grad():
-            # sample using midpoint solver
-            xt = torch.rand(1, 1, 16, args.resolution // 8, args.resolution // 8,
-                            dtype=torch.float32, device=device)
-            T = torch.linspace(0, 1, 51, device=device)  # sample times
-            prompt_embeds = text_encoder.tokenize("video", "cpu")
-            prompt_embeds = text_encoder(prompt_embeds).to(device)
-            prompt_embeds = prompt_embeds.expand(
-                xt.shape[0], *prompt_embeds.shape)
-            mask = torch.zeros(1, 8, dtype=torch.int, device=device)
-            mask[0] = 1
-            odefunc = partial(model.forward, ctx=prompt_embeds, mask=mask)
-            sol = list()
-            for i in range(50):
-                t_start = T[i].expand(xt.shape[0])
-                t_end = T[i + 1].expand(xt.shape[0])
-                xt = xt + (t_end - t_start)[..., None, None, None] * odefunc(
-                    t=t_start + (t_end - t_start) /
-                    2, x=xt + odefunc(x=xt, t=t_start) * ((t_end - t_start) / 2)[..., None, None, None])
-                sol.append(xt)
-            num_timesteps = len(sol)
-            frames = model.decode_frames(sol[-1], mask)
-            for i, frame in enumerate(frames[0]):
-                torchvision.transforms.ToPILImage()(
-                    frame * 0.5 + 0.5).save(args.output_dir / f"final_image_{i}.png")
-
-    cleanup()    # -------------------------------------------------------------------------
+    cleanup()

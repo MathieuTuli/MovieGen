@@ -1314,13 +1314,12 @@ class TAEConfig:
     num_res_blocks: int = 2
     attn_resolutions: Tuple[int] = tuple()
     dropout: float = 0.0
-    scale_factor: float = 1.
-    strict: bool = False
     loss_disc_start: int = 5001
     loss_kl_weight: float = 1e-6
     loss_disc_weight: float = 0.5
     loss_outlier_weight: float = 0  # 1e2
     loss_outlier_scaling_factor: float = 3
+    scaling_factor: float = 3.713188899219769
 
     def __init__(self, **kwargs):
         for k, v in kwargs.items():
@@ -1358,14 +1357,13 @@ class TAE(nn.Module):
             z_channels=config.z_channels,
             double_z=config.double_z,
             attn_resolutions=config.attn_resolutions)
-        self.strict = config.strict
 
         self.quant_conv = torch.nn.Conv2d(
             2 * config.z_channels, 2 * config.embed_dim, 1)
         self.post_quant_conv = torch.nn.Conv2d(
             config.embed_dim, config.z_channels, 1)
         self.embed_dim = config.embed_dim
-        self.scale_factor = config.scale_factor
+        self.scaling_factor = config.scaling_factor
         self.loss = LPIPSWithDiscriminator(
             disc_start=config.loss_disc_start,
             kl_weight=config.loss_kl_weight,
@@ -1390,18 +1388,7 @@ class TAE(nn.Module):
             if "temp_" in k and k not in sd:
                 sd[k] = temp_sd[k]
 
-        self.load_state_dict(sd, strict=self.strict)
-
-    def get_encoding(self, encoder_posterior):
-        if isinstance(encoder_posterior, DiagonalGaussianDistribution):
-            z = encoder_posterior.sample()
-        elif isinstance(encoder_posterior, torch.Tensor):
-            z = encoder_posterior
-        else:
-            raise NotImplementedError(
-                "encoder_posterior of type " +
-                f"{type(encoder_posterior)} not yet implemented")
-        return self.scale_factor * z
+        self.load_state_dict(sd, strict=True)
 
     def encode(self, x, mask):
         # temporal accounting
@@ -1429,7 +1416,7 @@ class TAE(nn.Module):
                 split: str = "val",
                 optimizer_idx: int = 0,
                 step: int = 0,
-                sample_posterior=True):
+                sample_posterior: bool = True):
         # temporal accounting
         posterior = self.encode(inputs, mask)
         if sample_posterior:
@@ -1437,10 +1424,6 @@ class TAE(nn.Module):
         else:
             z = posterior.mode()
         dec = self.decode(z, mask)
-        # REVISIT: is this needed?
-        # Tprime = inputs.shape[1]
-        # assert dec.shape[1] >= Tprime
-        # dec = dec[:, :Tprime]
 
         loss, log_dict = self.loss(
             inputs, dec, mask, posterior, optimizer_idx,  # 1 for val
