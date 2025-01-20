@@ -295,8 +295,11 @@ if __name__ == "__main__":
                     "psnr_video": list(),
                     "ssim_video": list(),
                 }
-                for vali, (x, mask) in enumerate(val_loader):
-                    if vali >= args.val_max_steps:
+                val_iter = iter(val_loader)
+                for vali in range(args.val_max_steps):
+                    try:
+                        x, mask = next(val_iter)
+                    except StopIteration:
                         break
                     x, mask = x.to(device), mask.to(device)
                     dec, _, loss, loss_dict = model(x, mask, "val", 1, vali)
@@ -308,10 +311,11 @@ if __name__ == "__main__":
                     for b in range(dec.shape[0]):
                         for t in range(dec.shape[1]):
                             fn = args.output_dir /\
-                                f"val_dec_{vali}_{b}_{t}.png"
+                                f"val_dec__vali_{vali}__B_{b}__T_{t}.png"
                             torchvision.transforms.ToPILImage()(
                                 (dec[b, t] + 1) * 0.5).save(fn)
-                            fn = args.output_dir / f"val_x_{vali}_{b}_{t}.png"
+                            fn = args.output_dir /\
+                                f"val_x__vali_{vali}__B_{b}__T_{t}.png"
                             torchvision.transforms.ToPILImage()(
                                 (x[b, t] + 1) * 0.5).save(fn)
                 val_loss /= vali

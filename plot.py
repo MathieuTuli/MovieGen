@@ -51,9 +51,10 @@ if __name__ == "__main__":
         'Outlier Loss': ['outlier_loss'],
         'KL Loss': ['kl_loss'],
         'NLL Loss': ['nll_loss'],
+        'Loss': ['loss'],
     }
 
-    fig, axes = plt.subplots(3, 2, figsize=(15, 12))
+    fig, axes = plt.subplots(4, 2, figsize=(5 * 4, 3 * 4))
     fig.suptitle('Training Losses Over Time', fontsize=16)
 
 

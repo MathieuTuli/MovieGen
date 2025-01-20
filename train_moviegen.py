@@ -67,10 +67,6 @@ def linear_quadratic_t_schedule(a: float = 0.,
     return first + second
 
 
-def euler_sampler():
-    pass
-
-
 def exists(val):
     return val is not None
 
@@ -379,6 +375,10 @@ class MovieGen(nn.Module):
             config.n_embd))
 
         print0("Initializing auxiliary models")
+        # self.text_encoder = TextEncoder(TextEncoderConfig())
+        # self.text_encoder.eval()
+        # for p in self.text_encoder.parameters():
+        #     p.requires_grad_(False)
         self.tae = TAE(TAEConfig())
         self.tae.eval()
         for p in self.tae.parameters():
@@ -675,8 +675,6 @@ args
 parser = argparse.ArgumentParser()
 # io
 # yes you can use parser types like this
-parser.add_argument("--ul2-ckpt", type=asspath, required=False)
-parser.add_argument("--byt5-ckpt", type=asspath, required=False)
 parser.add_argument("--metaclip-ckpt", type=asspath, required=False)
 parser.add_argument("--tae-ckpt", type=asspath, required=False)
 parser.add_argument("--output-dir", type=mkpath, default="")
@@ -686,7 +684,6 @@ parser.add_argument("--val-dir", type=asspath, default="dev/data/val-overfit")
 
 # checkpointing
 parser.add_argument("--ckpt", type=asspath, required=False)
-parser.add_argument("--ckpt-from-ldm", type=int, default=0, choices=[0, 1])
 parser.add_argument("--resume", type=int, default=0, choices=[0, 1])
 parser.add_argument("--ckpt-freq", type=int, default=-1)
 parser.add_argument("--device", type=str, default="cuda")
@@ -810,6 +807,7 @@ if __name__ == "__main__":
         ckpt = torch.load(args.ckpt, weights_only=False)
         start_step = ckpt["step"]
         best_val_loss = ckpt.get("best_val_loss", best_val_loss)
+        print0(f"Resuming from {start_step=}, {best_val_loss=}")
         del ckpt
     trainset_size = len(trainset) // ddp_world_size if ddp else len(trainset)
     valset_size = len(valset) // ddp_world_size if ddp else len(valset)
@@ -846,7 +844,7 @@ if __name__ == "__main__":
                     val_loss += loss.item()
                     frames = model.decode_frames(
                         x1 / model.tae.scaling_factor, mask)
-                val_loss /= vali
+                val_loss /= (vali + 1)
             if master_process and val_loss < best_val_loss:
                 best_val_loss = val_loss
                 torch.save({"step": step, "state_dict": model.state_dict(),
@@ -862,8 +860,9 @@ if __name__ == "__main__":
                 latent_T = 4
                 xt = torch.rand(1, latent_T, config.in_channels,
                                 args.resolution // 8, args.resolution // 8,
-                                dtype=torch.float32, device=device)
-                T = torch.linspace(0, 1, 200, device=device)  # sample times
+                                dtype=torch.float32, device=device) * \
+                    model.tae.scaling_factor
+                T = torch.linspace(0, 1, 1001, device=device)  # sample times
                 prompt_embeds = text_encoder.tokenize("video", "cpu")
                 prompt_embeds = text_encoder(prompt_embeds).to(device)
                 prompt_embeds = prompt_embeds.expand(
@@ -871,23 +870,20 @@ if __name__ == "__main__":
                 mask = torch.ones(1, 8 * latent_T,
                                   dtype=torch.int, device=device)
                 odefunc = partial(model.forward, ctx=prompt_embeds, mask=mask)
-                sol = list()
-                for i in range(50):
+                for i in range(len(T) - 1):
                     t_start = T[i].expand(xt.shape[0])
                     t_end = T[i + 1].expand(xt.shape[0])
                     xt = xt + (t_end - t_start)[..., None, None, None] * \
                         odefunc(t=t_start + (t_end - t_start) / 2,
                                 x=xt + odefunc(x=xt, t=t_start) * (
                             (t_end - t_start) / 2)[..., None, None, None])
-                    sol.append(xt)
-                num_timesteps = len(sol)
                 frames = model.decode_frames(
-                    sol[-1] / model.tae.scaling_factor, mask)
+                    xt / model.tae.scaling_factor, mask)
                 for i, frame in enumerate(frames[0]):
                     torchvision.transforms.ToPILImage()(
                         frame * 0.5 + 0.5).save(
                         args.output_dir /
-                        f"validation_sample_step_{step}_{i}.png")
+                        f"val_sample__step_{step}__frame_{i}.png")
         if last_step or args.inference_only:
             break
 
