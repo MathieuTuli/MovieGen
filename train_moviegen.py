@@ -208,11 +208,11 @@ class Block(nn.Module):
         shift_1, scale_1, alpha_1, shift_2, scale_2, alpha_2 = \
             self.adaLN_modulation(t_emb).chunk(6, dim=1)
         x = x + pos_emb
-        x = x + alpha_1 * self.attn(modulate(self.rmsnorm1(x),
-                                             shift_1, scale_1), mask=mask)
+        x = x + alpha_1.unsqueeze(1) * self.attn(
+                modulate(self.rmsnorm1(x), shift_1, scale_1), mask=mask)
         x = x + self.cross_attn(x, ctx, mask=mask)
-        x = x + alpha_2 * self.mlp(modulate(self.rmsnorm2(x),
-                                            shift_2, scale_2))
+        x = x + alpha_2.unsqueeze(1) * self.mlp(
+                modulate(self.rmsnorm2(x), shift_2, scale_2))
         return x
 
 
@@ -297,7 +297,9 @@ class OptimalTransportPath:
 
     def sample(self, x1: torch.Tensor, x0: torch.Tensor, t: torch.Tensor
                ) -> Tuple[torch.Tensor, torch.Tensor]:
-        t = t.expand_as(x1)
+        # REVISIT:
+        # t = t.expand_as(x1)
+        t = t.view(-1, *([1] * (x1.dim() - 1)))
         xt = x1 * t + (1 - (1 - self.sig_min) * t) * x0
         vt = x1 - (1 - self.sig_min) * x0
         return xt, vt
@@ -423,8 +425,8 @@ class MovieGen(nn.Module):
         nn.init.constant_(self.head.linear.bias, 0)
 
     def initialize_auxiliary_models(self,
-                                    metaclip_ckpt: Optional[Path],
-                                    tae_ckpt: Optional[Path]):
+                                    metaclip_ckpt: Path | None = None,
+                                    tae_ckpt: Path | None = None):
         if metaclip_ckpt is not None:
             print0(f"Loaded MetaClip weights from {metaclip_ckpt}.")
             self.text_encoder.from_pretrained(metaclip_ckpt)
@@ -479,12 +481,12 @@ class MovieGen(nn.Module):
     def step(self, x: torch.Tensor, x_1: torch.Tensor, t: torch.Tensor):
         return t * x_1 + (1 - (1 - self.config.sig_min) * t) * x
 
-    def encode_frames(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        x = self.tae.encode(x, mask)  # [B, T, C, H, W]
+    def encode_frames(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.tae.encode(x)  # [B, T, C, H, W]
         return x.sample()
 
-    def decode_frames(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        x = self.tae.decode(x, mask)
+    def decode_frames(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.tae.decode(x)
         return x
 
     def encode_prompts(self, prompts: List[str]) -> torch.Tensor:
@@ -608,8 +610,9 @@ dataloader
 
 
 class Dataset:
-    def __init__(self, root: Path, T: int, image_only: bool,
+    def __init__(self, root: Path | str, T: int, image_only: bool,
                  size: int = 256, train: bool = True,):
+        root = root if isinstance(root, Path) else Path(root)
         self.train = train
         self.image_only = image_only
         self.T = T
@@ -691,7 +694,7 @@ parser.add_argument("--device", type=str, default="cuda")
 # optimization
 parser.add_argument("--lr", type=float, default=1e-5)
 parser.add_argument("--weight-decay", type=float, default=0.0)
-parser.add_argument("--grad-clip", type=float, default=1.0)
+parser.add_argument("--grad-clip", type=float, default=None)
 parser.add_argument("--batch-size", type=int, default=1)
 parser.add_argument("--max-frames", type=int, default=32)
 parser.add_argument("--resolution", type=int, default=64)
@@ -774,6 +777,8 @@ if __name__ == "__main__":
         p.requires_grad_(False)
     model.to(device)
 
+    if args.image_only == 1:
+        args.max_frames = 8
     trainset = Dataset(args.train_dir, T=args.max_frames,
                        image_only=args.image_only == 1, size=args.resolution)
     valset = Dataset(args.val_dir, T=args.max_frames,
@@ -834,16 +839,14 @@ if __name__ == "__main__":
                     prompt_embeds = text_encoder(prompt_embeds).to(device)
                     prompt_embeds = prompt_embeds.expand(
                         x.shape[0], *prompt_embeds.shape)
-                    x1 = model.encode_frames(
-                        x, mask) * model.tae.scaling_factor
+                    x1 = model.encode_frames(x) * model.tae.scaling_factor
                     x0 = torch.randn_like(x1, device=device)
                     t = torch.rand(x1.shape[0], device=device)
                     xt, vt = path.sample(x1, x0, t)
                     v_model = model(t, xt, prompt_embeds, mask)
                     loss = torch.pow(v_model - vt, 2).mean()
                     val_loss += loss.item()
-                    frames = model.decode_frames(
-                        x1 / model.tae.scaling_factor, mask)
+                    frames = model.decode_frames(x1 / model.tae.scaling_factor)
                 val_loss /= (vali + 1)
             if master_process and val_loss < best_val_loss:
                 best_val_loss = val_loss
@@ -857,11 +860,10 @@ if __name__ == "__main__":
                     f.write(f"{step},val/loss,{val_loss}\n")
             with torch.no_grad():
                 # sample using midpoint solver
-                latent_T = 4
+                latent_T = args.max_frames // 8
                 xt = torch.rand(1, latent_T, config.in_channels,
                                 args.resolution // 8, args.resolution // 8,
-                                dtype=torch.float32, device=device) * \
-                    model.tae.scaling_factor
+                                dtype=torch.float32, device=device)
                 T = torch.linspace(0, 1, 1001, device=device)  # sample times
                 prompt_embeds = text_encoder.tokenize("video", "cpu")
                 prompt_embeds = text_encoder(prompt_embeds).to(device)
@@ -877,8 +879,7 @@ if __name__ == "__main__":
                         odefunc(t=t_start + (t_end - t_start) / 2,
                                 x=xt + odefunc(x=xt, t=t_start) * (
                             (t_end - t_start) / 2)[..., None, None, None])
-                frames = model.decode_frames(
-                    xt / model.tae.scaling_factor, mask)
+                frames = model.decode_frames(xt / model.tae.scaling_factor)
                 for i, frame in enumerate(frames[0]):
                     torchvision.transforms.ToPILImage()(
                         frame * 0.5 + 0.5).save(
@@ -896,8 +897,10 @@ if __name__ == "__main__":
         x, mask = x.to(device), mask.to(device)
         prompt_embeds = text_encoder.tokenize("video", "cpu")
         prompt_embeds = text_encoder(prompt_embeds).to(device)
-        prompt_embeds = prompt_embeds.expand(x.shape[0], *prompt_embeds.shape)
-        x1 = model.encode_frames(x, mask) * model.tae.scaling_factor
+        x1 = model.encode_frames(x) * model.tae.scaling_factor
+        x1 = x1.repeat(16, *([1] * (x1.dim() - 1)))
+        mask = mask.repeat(16, 1)
+        prompt_embeds = prompt_embeds.expand(x1.shape[0], *prompt_embeds.shape)
         x0 = torch.randn_like(x1, device=device)
         t = torch.rand(x1.shape[0], device=device)
         xt, vt = path.sample(x1, x0, t)
@@ -906,8 +909,10 @@ if __name__ == "__main__":
         loss.backward()
         # if ddp:
         #     dist.all_reduce(loss, op=dist.ReduceOp.AVG)
-        norm = torch.nn.utils.clip_grad_norm_(
-            model.parameters(), args.grad_clip)
+        norm = None
+        if args.grad_clip is not None:
+            norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters(), args.grad_clip)
         # step the optimizer
         optimizer.step()
 
@@ -915,7 +920,7 @@ if __name__ == "__main__":
         t1 = time.time()
         print0(f"""step {step+1:4d}/{args.num_iterations} | \
                train loss {loss.item():.6f} | \
-               norm {norm:.4f} | \
+               norm {norm if norm is None else f"{norm:.4f}"} | \
                """)
         if master_process and train_logfile is not None:
             with open(train_logfile, "a") as f:

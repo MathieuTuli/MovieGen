@@ -229,7 +229,7 @@ if __name__ == "__main__":
         with torch.no_grad():
             for x, mask in train_loader:
                 x, mask = x.to(device), mask.to(device)
-                latents = model.encode(x, mask).sample()
+                latents = model.encode(x).sample()
                 all_latents.append(latents.cpu())
         local_latents = torch.cat(all_latents)
 
@@ -311,11 +311,11 @@ if __name__ == "__main__":
                     for b in range(dec.shape[0]):
                         for t in range(dec.shape[1]):
                             fn = args.output_dir /\
-                                f"val_dec__vali_{vali}__B_{b}__T_{t}.png"
+                                f"val_dec__step_{step}_vali_{vali}__B_{b}__T_{t}.png"  # noqa
                             torchvision.transforms.ToPILImage()(
                                 (dec[b, t] + 1) * 0.5).save(fn)
                             fn = args.output_dir /\
-                                f"val_x__vali_{vali}__B_{b}__T_{t}.png"
+                                f"val_x__step_{step}_vali_{vali}__B_{b}__T_{t}.png"  # noqa
                             torchvision.transforms.ToPILImage()(
                                 (x[b, t] + 1) * 0.5).save(fn)
                 val_loss /= vali

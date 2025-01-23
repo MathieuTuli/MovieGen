@@ -100,7 +100,6 @@ class Upsample(nn.Module):
             _, C, H, W = x.shape
             x = x.view(B, T, C, H, W).permute(0, 3, 4, 2, 1).contiguous()
             x = x.view(B * H * W, C, T)
-            # REVISIT:
             if self.temp_conv is not None:
                 x = torch.nn.functional.interpolate(
                     x, scale_factor=2.0, mode="nearest")
@@ -257,6 +256,8 @@ class TemporalResnetBlock(nn.Module):
         return x + h
 
 
+"""
+# DEPRECATE:
 class TemporalAttention(nn.Module):
     def __init__(self, in_channels):
         super().__init__()
@@ -293,7 +294,7 @@ class TemporalAttention(nn.Module):
 
         h_ = x
         B, T, C, H, W = h_.shape
-        h_ = h_.permute(0, 3, 4, 2, 1).contiguous().view(B * H * W, C, T)
+        h_ = h_.permute(0, 3, 4, 2, 1).contiguous().view(B * H * W, T, C)
         h_ = self.norm(h_)
         q = self.q(h_)
         k = self.k(h_)
@@ -320,6 +321,114 @@ class TemporalAttention(nn.Module):
         _, C, T = h_.shape
         h_ = h_.view(B, H, W, C, T).permute(0, 4, 3, 1, 2).contiguous()
         return x + h_
+"""
+
+
+def prepare_for_attention(qkv: torch.Tensor, head_dim: int, qk_norm: bool = True):
+    """
+    Borrowed from Mochi
+    https://github.com/genmoai/mochi/blob/main/src/genmo/mochi_preview/vae/models.py
+
+    Prepare qkv tensor for attention and normalize qk.
+
+    Args:
+        qkv: Input tensor. Shape: [B, L, 3 * num_heads * head_dim].
+
+    Returns:
+        q, k, v: qkv tensor split into q, k, v. Shape: [B, num_heads, L, head_dim].
+    """
+    assert qkv.ndim == 3  # [B, L, 3 * num_heads * head_dim]
+    assert qkv.size(2) % (3 * head_dim) == 0
+    num_heads = qkv.size(2) // (3 * head_dim)
+    qkv = qkv.unflatten(2, (3, num_heads, head_dim))
+
+    q, k, v = qkv.unbind(2)  # [B, L, num_heads, head_dim]
+    q = q.transpose(1, 2)  # [B, num_heads, L, head_dim]
+    k = k.transpose(1, 2)  # [B, num_heads, L, head_dim]
+    v = v.transpose(1, 2)  # [B, num_heads, L, head_dim]
+
+    if qk_norm:
+        q = nn.functional.normalize(q, p=2, dim=-1)
+        k = nn.functional.normalize(k, p=2, dim=-1)
+
+        # Mixed precision can change the dtype of normed q/k to float32.
+        q = q.to(dtype=qkv.dtype)
+        k = k.to(dtype=qkv.dtype)
+
+    return q, k, v
+
+
+class TemporalAttention(nn.Module):
+    """
+    Borrowed from Mochi
+    https://github.com/genmoai/mochi/blob/main/src/genmo/mochi_preview/vae/models.py
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        head_dim: int = 32,
+        qkv_bias: bool = False,
+        out_bias: bool = True,
+        qk_norm: bool = True,
+    ) -> None:
+        super().__init__()
+        self.head_dim = head_dim
+        self.num_heads = in_channels // head_dim
+        self.qk_norm = qk_norm
+
+        self.qkv = nn.Linear(in_channels, 3 * in_channels, bias=qkv_bias)
+        self.out = nn.Linear(in_channels, in_channels, bias=out_bias)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute temporal self-attention.
+
+        Args:
+            x: Input tensor. Shape: [B, C, T, H, W].
+            chunk_size: Chunk size for large tensors.
+
+        Returns:
+            x: Output tensor. Shape: [B, C, T, H, W].
+        """
+        B, T, C, H, W = x.shape
+
+        if T == 1:
+            # No attention for single frame.
+            x = x.movedim(2, -1)  # [B, T, C, H, W] -> [B, T, H, W, C]
+            qkv = self.qkv(x)
+            _, _, x = qkv.chunk(3, dim=-1)  # Throw away queries and keys.
+            x = self.out(x)
+            return x.movedim(-1, 2)  # [B, T, H, W, C] -> [B, T, C, H, W]
+
+        # 1D temporal attention.
+        x = rearrange(x, "B T C H W -> (B H W) T C")
+        qkv = self.qkv(x)
+
+        # Input: qkv with shape [B, T, 3 * num_heads * head_dim]
+        # Output: x with shape [B, num_heads, T, head_dim]
+
+        attn_kwargs = dict(
+            attn_mask=None,
+            dropout_p=0.0,
+            is_causal=True,
+            scale=self.head_dim**-0.5,
+        )
+
+        q, k, v = prepare_for_attention(
+            qkv, self.head_dim, qk_norm=self.qk_norm)
+        x = nn.functional.scaled_dot_product_attention(
+            q, k, v, **attn_kwargs)  # [B, num_heads, T, head_dim]
+        assert x.size(0) == q.size(0)
+
+        x = x.transpose(1, 2)  # [B, T, num_heads, head_dim]
+        x = x.flatten(2)  # [B, T, num_heads * head_dim]
+
+        x = self.out(x)
+        x = rearrange(x, "(B H W) T C -> B T C H W", B=B, H=H, W=W)
+        return x
 
 
 class LinAttnBlock(LinearAttention):
@@ -356,7 +465,7 @@ class AttnBlock(nn.Module):
                                         stride=1,
                                         padding=0)
 
-    def forward(self, x, mask=None):
+    def forward(self, x):
         h_ = x
         B, T, C, H, W = h_.shape
         h_ = h_.view(B * T, C, H, W)
@@ -373,11 +482,6 @@ class AttnBlock(nn.Module):
         w_ = torch.bmm(q, k)     # b,hw,hw    w[b,i,j]=sum_c q[b,i,c]k[b,c,j]
         w_ = w_ * (int(c)**(-0.5))
 
-        if mask is not None and False:
-            import pdb; pdb.set_trace()
-            mask = rearrange(mask, 'b j -> b 1 j')
-            w_ = w_.masked_fill(~mask.to(torch.int),
-                                -torch.finfo(w_.dtype).max)
         w_ = torch.nn.functional.softmax(w_, dim=2)
 
         # attend to values
@@ -501,7 +605,7 @@ class TemporalEncoder(nn.Module):
         self.temp_conv_out = TemporalConv1d(
             block_out, block_out, kernel_size=3, stride=1)
 
-    def forward(self, x, mask=None):
+    def forward(self, x):
         # timestep embedding
         temb = None
 
@@ -523,7 +627,7 @@ class TemporalEncoder(nn.Module):
                 if len(self.down[i_level].attn) > 0:
                     # B, T, C, H, W = h.shape
                     # h = h.view(B * T, C, H, W)
-                    h = self.down[i_level].attn[str(i_block)](h, mask)
+                    h = self.down[i_level].attn[str(i_block)](h)
                     # h = h.view(B, T, C, H, W)
                 hs.append(h)
             if i_level != self.num_resolutions-1:
@@ -534,9 +638,9 @@ class TemporalEncoder(nn.Module):
         h = self.mid.block_1(h, temb)
         # B, T, C, H, W = h.shape
         # h = h.view(B * T, C, H, W)
-        h = self.mid.attn_1(h, mask)
+        h = self.mid.attn_1(h)
         # temporal inflation
-        h = self.mid.temp_attn_1(h, mask)
+        h = self.mid.temp_attn_1(h)
         # h = h.view(B, T, C, H, W)
         h = self.mid.block_2(h, temb)
 
@@ -658,7 +762,7 @@ class TemporalDecoder(nn.Module):
         self.temp_conv_out = TemporalConv1d(
             out_ch, out_ch, kernel_size=3, stride=1)
 
-    def forward(self, z, mask=None):
+    def forward(self, z):
         # assert z.shape[1:] == self.z_shape[1:]
         self.last_z_shape = z.shape
 
@@ -681,9 +785,9 @@ class TemporalDecoder(nn.Module):
         h = self.mid.block_1(h, temb)
         # B, T, C, H, W = h.shape
         # h = h.view(B * T, C, H, W)
-        h = self.mid.attn_1(h, mask)
+        h = self.mid.attn_1(h)
         # temporal inflation
-        self.mid.temp_attn_1(h, mask)
+        self.mid.temp_attn_1(h)
         # h = h.view(B, T, C, H, W)
         h = self.mid.block_2(h, temb)
 
@@ -694,7 +798,7 @@ class TemporalDecoder(nn.Module):
                 if len(self.up[i_level].attn) > 0:
                     # B, T, C, H, W = h.shape
                     # h = h.view(B * T, C, H, W)
-                    h = self.up[i_level].attn[str(i_block)](h, mask)
+                    h = self.up[i_level].attn[str(i_block)](h)
                     # h = h.view(B, T, C, H, W)
             if i_level != 0:
                 h = self.up[i_level].upsample(h)
@@ -1390,9 +1494,9 @@ class TAE(nn.Module):
 
         self.load_state_dict(sd, strict=True)
 
-    def encode(self, x, mask):
+    def encode(self, x):
         # temporal accounting
-        x = self.encoder(x, mask)
+        x = self.encoder(x)
         B, T, C, H, W = x.shape
         x = x.view(B * T, C, H, W)
         moments = self.quant_conv(x)
@@ -1401,14 +1505,14 @@ class TAE(nn.Module):
         posterior = DiagonalGaussianDistribution(moments)
         return posterior
 
-    def decode(self, z, mask):
+    def decode(self, z):
         # temporal accounting
         B, T, C, H, W = z.shape
         z = z.view(B * T, C, H, W)
         z = self.post_quant_conv(z)
         _, C, H, W = z.shape
         z = z.view(B, T, C, H, W)
-        dec = self.decoder(z, mask)
+        dec = self.decoder(z)
         # temporal accounting
         return dec
 
@@ -1418,12 +1522,12 @@ class TAE(nn.Module):
                 step: int = 0,
                 sample_posterior: bool = True):
         # temporal accounting
-        posterior = self.encode(inputs, mask)
+        posterior = self.encode(inputs)
         if sample_posterior:
             z = posterior.sample()
         else:
             z = posterior.mode()
-        dec = self.decode(z, mask)
+        dec = self.decode(z)
 
         loss, log_dict = self.loss(
             inputs, dec, mask, posterior, optimizer_idx,  # 1 for val

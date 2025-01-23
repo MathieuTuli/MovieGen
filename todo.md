@@ -69,3 +69,7 @@ TODOs for MovieGen implementation - I'm working on this on the side of many othe
 - [ ] replace the `8` with a `compression factor`
     - similarly, adjust to divide by `patch_k[0]` for time dimension ops
 - [ ] logging after resume, connect to previous logs
+- [ ] masking compression, is currently done in the movie gen forward pass, remove that
+- [ ] the transformer backbone should be its own model, and save its own weights
+    - rather than the moviegen having to instantiate it as a member module
+- [ ] for logging, on resume, need to clear the steps if resuming from earlier step start
