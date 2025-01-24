@@ -16,6 +16,7 @@ from torch.utils.data import DataLoader
 from PIL import Image
 
 # import torch.distributed as dist
+import torch.distributed as dist
 import numpy as np
 import torchvision
 import torch
@@ -348,8 +349,8 @@ if __name__ == "__main__":
         x, mask = x.to(device), mask.to(device)
         dec, post, loss_ae, loss_dict_ae = model(x, mask, "train", 0, step)
         loss_ae.backward()
-        # if ddp:
-        #     dist.all_reduce(loss_ae, op=dist.ReduceOp.AVG)
+        if ddp:
+            dist.all_reduce(loss_ae, op=dist.ReduceOp.AVG)
         norm = torch.nn.utils.clip_grad_norm_(
             model.parameters(), args.grad_clip)
         # step the optimizer
@@ -365,8 +366,8 @@ if __name__ == "__main__":
 
         dec, post, loss_disc, loss_dict_disc = model(x, mask, "train", 1, step)
         loss_disc.backward()
-        # # if ddp:
-        # #     dist.all_reduce(loss_disc, op=dist.ReduceOp.AVG)
+        if ddp:
+            dist.all_reduce(loss_disc, op=dist.ReduceOp.AVG)
         norm = torch.nn.utils.clip_grad_norm_(
             model.parameters(), args.grad_clip)
         # step the optimizer

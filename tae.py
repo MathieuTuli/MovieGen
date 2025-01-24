@@ -1476,7 +1476,7 @@ class TAE(nn.Module):
             outlier_loss_weight=config.loss_outlier_weight,
         )
 
-    def from_pretrained(self, ckpt: Path, ignore_keys: List[str] = None,):
+    def from_pretrained(self, ckpt: Path, ignore_keys: List[str] | None = None,):
         ignore_keys = ignore_keys or list()
         sd = torch.load(ckpt, map_location="cpu",
                         weights_only=False)["state_dict"]
@@ -1492,7 +1492,7 @@ class TAE(nn.Module):
             if "temp_" in k and k not in sd:
                 sd[k] = temp_sd[k]
 
-        self.load_state_dict(sd, strict=True)
+        self.load_state_dict(sd, strict=ignore_keys is None)
 
     def encode(self, x):
         # temporal accounting

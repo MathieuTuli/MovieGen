@@ -24,6 +24,7 @@ from einops import rearrange, repeat
 from torch import einsum
 from PIL import Image
 
+import torch.distributed as dist
 import matplotlib.pyplot as plt
 import torch.nn as nn
 import numpy as np
@@ -381,7 +382,8 @@ class MovieGen(nn.Module):
         # self.text_encoder.eval()
         # for p in self.text_encoder.parameters():
         #     p.requires_grad_(False)
-        self.tae = TAE(TAEConfig())
+        tconfig = TAEConfig()
+        self.tae = TAE(tconfig)
         self.tae.eval()
         for p in self.tae.parameters():
             p.requires_grad_(False)
@@ -907,8 +909,8 @@ if __name__ == "__main__":
         v_model = model(t, xt, prompt_embeds, mask)
         loss = torch.pow(v_model - vt, 2).mean()
         loss.backward()
-        # if ddp:
-        #     dist.all_reduce(loss, op=dist.ReduceOp.AVG)
+        if ddp:
+            dist.all_reduce(loss, op=dist.ReduceOp.AVG)
         norm = None
         if args.grad_clip is not None:
             norm = torch.nn.utils.clip_grad_norm_(
