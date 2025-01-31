@@ -250,61 +250,6 @@ class TemporalResnetBlock(nn.Module):
         return x + h
 
 
-# DEPRECATE:
-class TemporalAttention(nn.Module):
-    def __init__(self, in_channels):
-        super().__init__()
-        self.in_channels = in_channels
-
-        self.norm = Normalize(in_channels, in_channels)
-        self.q = TemporalConv1d(in_channels,
-                                in_channels,
-                                kernel_size=1,
-                                stride=1,
-                                padding=0)
-        self.k = TemporalConv1d(in_channels,
-                                in_channels,
-                                kernel_size=1,
-                                stride=1,
-                                padding=0)
-        self.v = TemporalConv1d(in_channels,
-                                in_channels,
-                                kernel_size=1,
-                                stride=1,
-                                padding=0)
-        self.proj_out = TemporalConv1d(in_channels,
-                                       in_channels,
-                                       kernel_size=1,
-                                       stride=1,
-                                       padding=0)
-
-    def forward(self, x):
-        h_ = x
-        B, T, C, H, W = h_.shape
-        h_ = h_.permute(0, 3, 4, 1, 2).contiguous().view(B * H * W, T, C)
-        h_ = self.norm(h_)
-        q = self.q(h_)
-        k = self.k(h_)
-        v = self.v(h_)
-
-        # compute attention
-        b, c, t = q.shape
-        q = q.permute(0, 2, 1)   # b,t,c
-        w_ = torch.bmm(q, k)     # b,t,t   w[b,i,j]=sum_c q[b,i,c]k[b,c,j]
-        w_ = w_ * (int(c)**(-0.5))
-        w_ = torch.nn.functional.softmax(w_, dim=2)
-
-        # attend to values
-        w_ = w_.permute(0, 2, 1)   # b,,t (first hw of k, second of q)
-        # b, c,hw (hw of q) h_[b,c,j] = sum_i v[b,c,i] w_[b,i,j]
-        h_ = torch.bmm(v, w_)
-
-        h_ = self.proj_out(h_)
-        _, T, C = h_.shape
-        h_ = h_.view(B, H, W, T, C).permute(0, 3, 4, 1, 2).contiguous()
-        return x + h_
-
-
 def prepare_for_attention(qkv: torch.Tensor, head_dim: int, qk_norm: bool = True):
     """
     Borrowed from Mochi
@@ -339,7 +284,7 @@ def prepare_for_attention(qkv: torch.Tensor, head_dim: int, qk_norm: bool = True
     return q, k, v
 
 
-class TemporalAttentionMochi(nn.Module):
+class TemporalAttention(nn.Module):
     """
     Borrowed from Mochi
     https://github.com/genmoai/mochi/blob/main/src/genmo/mochi_preview/vae/models.py
@@ -371,6 +316,7 @@ class TemporalAttentionMochi(nn.Module):
         Returns:
             x: Output tensor. Shape: [B, C, T, H, W].
         """
+        h_ = x
         B, T, C, H, W = x.shape
 
         if T == 1:
@@ -406,7 +352,7 @@ class TemporalAttentionMochi(nn.Module):
 
         x = self.out(x)
         x = rearrange(x, "(B H W) T C -> B T C H W", B=B, H=H, W=W)
-        return x
+        return h_ + x
 
 
 class LinAttnBlock(LinearAttention):
@@ -546,8 +492,7 @@ class TemporalEncoder(nn.Module):
                                                  attn_type=attn_type)})
                     # temporal inflation
                     attn_dict.update(
-                        {f"temp_attn_{i_block}": TemporalAttention(
-                            Tshape_in)})
+                        {f"temp_attn_{i_block}": TemporalAttention(block_in)})
             down = nn.Module()
             down.block = block
             down.attn = nn.ModuleDict(attn_dict)
@@ -565,7 +510,7 @@ class TemporalEncoder(nn.Module):
                                                dropout=dropout)
         self.mid.attn_1 = make_attn(block_in, attn_type=attn_type)
         # temporal inflation
-        self.mid.temp_attn_1 = TemporalAttention(Tshape_in)
+        self.mid.temp_attn_1 = TemporalAttention(block_in)
         self.mid.block_2 = TemporalResnetBlock(in_channels=block_in,
                                                out_channels=block_in,
                                                dropout=dropout)
@@ -692,7 +637,7 @@ class TemporalDecoder(nn.Module):
         # REVISIT:
         # idk what i'm doing with the temoral attn rn
         Tshape_in = 4
-        self.mid.temp_attn_1 = TemporalAttention(Tshape_in)
+        self.mid.temp_attn_1 = TemporalAttention(block_in)
         self.mid.block_2 = TemporalResnetBlock(in_channels=block_in,
                                                out_channels=block_in,
                                                dropout=dropout)
@@ -715,7 +660,7 @@ class TemporalDecoder(nn.Module):
                     # temporal inflation
                     attn_dict.update(
                         {f"temp_attn_{i_block}": TemporalAttention(
-                            Tshape_in)})
+                            block_in)})
             up = nn.Module()
             up.block = block
             up.attn = nn.ModuleDict(attn_dict)
@@ -759,7 +704,7 @@ class TemporalDecoder(nn.Module):
         # h = h.view(B * T, C, H, W)
         h = self.mid.attn_1(h)
         # temporal inflation
-        self.mid.temp_attn_1(h)
+        h = self.mid.temp_attn_1(h)
         # h = h.view(B, T, C, H, W)
         h = self.mid.block_2(h)
 
@@ -1327,6 +1272,7 @@ class LPIPSWithDiscriminator(nn.Module):
             disc_factor = adopt_weight(
                 self.disc_factor, global_step,
                 threshold=self.discriminator_iter_start)
+            d_weight = d_weight.to("cuda:0")
             loss = weighted_nll_loss + self.kl_weight * \
                 kl_loss + d_weight * disc_factor * g_loss + \
                 outlier_loss * self.outlier_loss_weight
@@ -1391,10 +1337,10 @@ class TAEConfig:
     num_res_blocks: int = 2
     attn_resolutions: Tuple[int] = tuple()
     dropout: float = 0.0
-    loss_disc_start: int = 5001
-    loss_kl_weight: float = 1e-6
+    loss_disc_start: int = 10000
+    loss_kl_weight: float = 0
     loss_disc_weight: float = 0.5
-    loss_outlier_weight: float = 1e2
+    loss_outlier_weight: float = 0  # 1e2
     loss_outlier_scaling_factor: float = 3
     scaling_factor: float = 3.713188899219769
 
@@ -1449,6 +1395,14 @@ class TAE(nn.Module):
             outlier_loss_weight=config.loss_outlier_weight,
         )
 
+    def to(self, device):
+        self.encoder.to("cuda:0")
+        self.quant_conv.to("cuda:0")
+        self.decoder.to("cuda:1")
+        self.post_quant_conv.to("cuda:1")
+        self.loss.to("cuda:0")
+        return self
+
     def from_pretrained(self, ckpt: Path, ignore_keys: List[str] | None = None,):
         ignore_keys = ignore_keys or list()
         sd = torch.load(ckpt, map_location="cpu",
@@ -1495,12 +1449,15 @@ class TAE(nn.Module):
                 step: int = 0,
                 sample_posterior: bool = True):
         # temporal accounting
+        inputs = inputs.to("cuda:0")
         posterior = self.encode(inputs)
         if sample_posterior:
             z = posterior.sample()
         else:
             z = posterior.mode()
+        z = z.to("cuda:1")
         dec = self.decode(z)
+        dec = dec.to("cuda:0")
 
         loss, log_dict = self.loss(
             inputs, dec, mask, posterior, optimizer_idx,  # 1 for val

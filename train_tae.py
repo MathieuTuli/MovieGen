@@ -29,8 +29,10 @@ from util import (
 
 
 class Dataset:
-    def __init__(self, root: Path, T: int, size: int = 64, train: bool = True):
+    def __init__(self, root: Path, T: int, image_only: bool,
+                 size: int = 64, train: bool = True):
         self.train = train
+        self.image_only = image_only
         self.T = T
         self.files = list()
         for ext in ('*.mp4', '*.avi', '*.mov', '*.mkv', '*.webm', '*.gif'):
@@ -63,7 +65,7 @@ class Dataset:
         video = self.load_video(self.files[index])
         vlen = video.shape[0]
         # 1:3 image/video ratio from paper
-        if random.random() < 0.25 and self.train:
+        if self.image_only or (random.random() < 0.25 and self.train):
             id = random.randint(0, vlen - 1) if self.train else 0
             frame = video[id]
             zero_pad = torch.zeros(self.T - 1, *frame.shape,
@@ -106,12 +108,13 @@ parser.add_argument("--ckpt-freq", type=int, default=-1)
 parser.add_argument("--device", type=str, default="cuda")
 
 # optimization
-parser.add_argument("--lr", type=float, default=1e-5)
+parser.add_argument("--lr", type=float, default=1e-4)
 parser.add_argument("--weight-decay", type=float, default=0.0)
 parser.add_argument("--grad-clip", type=float, default=1.0)
 parser.add_argument("--batch-size", type=int, default=1)
 parser.add_argument("--max-frames", type=int, default=32)
 parser.add_argument("--resolution", type=int, default=64)
+parser.add_argument("--image-only", type=int, default=0)
 
 parser.add_argument("--num-iterations", type=int, default=10)
 parser.add_argument("--val-loss-every", type=int, default=0)
@@ -197,8 +200,13 @@ if __name__ == "__main__":
         model = torch.compile(model)
     model.to(device)
 
-    trainset = Dataset(args.train_dir, T=args.max_frames, size=args.resolution)
+    if args.image_only == 1:
+        assert args.max_frames == 8
+    trainset = Dataset(args.train_dir, T=args.max_frames,
+                       image_only=args.image_only == 1,
+                       size=args.resolution)
     valset = Dataset(args.val_dir, T=args.max_frames,
+                     image_only=args.image_only == 1,
                      size=args.resolution, train=False)
     train_sampler = DistributedSampler(trainset, shuffle=True) if ddp else None
     val_sampler = DistributedSampler(valset) if ddp else None
@@ -360,10 +368,6 @@ if __name__ == "__main__":
         optimizer_disc.zero_grad(set_to_none=True)
 
         # fetch a batch
-        # REVISIT: should I be getting the next batch here?
-        # x, mask = train_loader.next_batch()
-        # x, mask = x.to(device), mask.to(device)
-
         dec, post, loss_disc, loss_dict_disc = model(x, mask, "train", 1, step)
         loss_disc.backward()
         if ddp:

@@ -780,7 +780,7 @@ if __name__ == "__main__":
     model.to(device)
 
     if args.image_only == 1:
-        args.max_frames = 8
+        assert args.max_frames == 8
     trainset = Dataset(args.train_dir, T=args.max_frames,
                        image_only=args.image_only == 1, size=args.resolution)
     valset = Dataset(args.val_dir, T=args.max_frames,
