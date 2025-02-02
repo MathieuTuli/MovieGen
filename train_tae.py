@@ -34,6 +34,8 @@ class Dataset:
         self.train = train
         self.image_only = image_only
         self.T = T
+        # Add shared state for batch-level decision
+        self.use_image_mode = None
         self.files = list()
         for ext in ('*.mp4', '*.avi', '*.mov', '*.mkv', '*.webm', '*.gif'):
             self.files.extend(root.glob(ext))
@@ -61,29 +63,26 @@ class Dataset:
         return x
 
     def __getitem__(self, index):
-        mask = torch.ones([self.T])
+        # Make batch-level decision if not already made
+        if self.use_image_mode is None:
+            self.use_image_mode = self.image_only or (
+                random.random() < 0.25 and self.train)
+
         video = self.load_video(self.files[index])
         vlen = video.shape[0]
-        # 1:3 image/video ratio from paper
-        if self.image_only or (random.random() < 0.25 and self.train):
+
+        if self.use_image_mode:
             id = random.randint(0, vlen - 1) if self.train else 0
             frame = video[id]
-            zero_pad = torch.zeros(self.T - 1, *frame.shape,
-                                   dtype=frame.dtype)
+            # NOTE: using 8 magic number for single frame
+            zero_pad = torch.zeros(8 - 1, *frame.shape, dtype=frame.dtype)
             x = torch.cat([frame[None, :], zero_pad], dim=0)
-            mask[1:] = 0
         else:
             id = 0
             if self.train:
                 id = random.randint(0, max(vlen - self.T - 1, 0))
             x = video[id:id + self.T]
-            if x.shape[0] < self.T:
-                zero_pad = torch.zeros(self.T - x.shape[0],
-                                       *x.shape[1:],
-                                       dtype=frame.dtype)
-                x = torch.cat([x, zero_pad], dim=0)
-            mask[x.shape[1]:] = 0
-        return x, mask
+        return x
 
 
 """
@@ -96,9 +95,10 @@ parser = argparse.ArgumentParser()
 # io
 # yes you can use parser types like this
 parser.add_argument("--output-dir", type=mkpath, default="")
-parser.add_argument("--train-dir", type=asspath,
+parser.add_argument("--train-data-dir", type=asspath,
                     default="dev/data/train-overfit")
-parser.add_argument("--val-dir", type=asspath, default="dev/data/val-overfit")
+parser.add_argument("--val-data-dir", type=asspath,
+                    default="dev/data/val-overfit")
 
 # checkpointing
 parser.add_argument("--ckpt", type=asspath, required=False)
@@ -112,6 +112,7 @@ parser.add_argument("--lr", type=float, default=1e-4)
 parser.add_argument("--weight-decay", type=float, default=0.0)
 parser.add_argument("--grad-clip", type=float, default=1.0)
 parser.add_argument("--batch-size", type=int, default=1)
+parser.add_argument("--total-batch-size", type=int, default=None)
 parser.add_argument("--max-frames", type=int, default=32)
 parser.add_argument("--resolution", type=int, default=64)
 parser.add_argument("--image-only", type=int, default=0)
@@ -119,7 +120,6 @@ parser.add_argument("--image-only", type=int, default=0)
 parser.add_argument("--num-iterations", type=int, default=10)
 parser.add_argument("--val-loss-every", type=int, default=0)
 parser.add_argument("--val-max-steps", type=int, default=20)
-parser.add_argument("--overfit-batch", default=1, type=int)
 
 parser.add_argument("--inference-only", default=0, type=int, choices=[0, 1])
 parser.add_argument("--compute-magic-number", default=0,
@@ -187,6 +187,7 @@ if __name__ == "__main__":
                 "decoder.conv_in",
                 "quant_conv",
                 "post_quant_conv",
+                "loss",
             ]
 
         # if args.resume == 0:
@@ -200,22 +201,37 @@ if __name__ == "__main__":
         model = torch.compile(model)
     model.to(device)
 
-    if args.image_only == 1:
-        assert args.max_frames == 8
-    trainset = Dataset(args.train_dir, T=args.max_frames,
+    trainset = Dataset(args.train_data_dir, T=args.max_frames,
                        image_only=args.image_only == 1,
                        size=args.resolution)
-    valset = Dataset(args.val_dir, T=args.max_frames,
+    valset = Dataset(args.val_data_dir, T=args.max_frames,
                      image_only=args.image_only == 1,
                      size=args.resolution, train=False)
+    if args.val_max_steps < 0:
+        args.val_max_steps = len(valset)
     train_sampler = DistributedSampler(trainset, shuffle=True) if ddp else None
     val_sampler = DistributedSampler(valset) if ddp else None
-    batch_size = args.batch_size // ddp_world_size
+    batch_size = args.batch_size
+    grad_accum_steps = args.total_batch_size // ddp_world_size
+    print0(f"Total desired batch size: {args.total_batch_size}")
+    print0(f"=> batch size per rank: {batch_size}")
+    print0(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
+
+    def train_worker_init_fn(worker_id):
+        # Reset the shared state for each new batch
+        trainset.use_image_mode = None
+
+    def val_worker_init_fn(worker_id):
+        # Reset the shared state for each new batch
+        trainset.use_image_mode = None
+
     train_loader = DataLoader(trainset, batch_size=batch_size,
                               shuffle=(train_sampler is None),
-                              num_workers=4, sampler=train_sampler)
+                              num_workers=4, sampler=train_sampler,
+                              worker_init_fn=train_worker_init_fn)
     val_loader = DataLoader(valset, batch_size=batch_size,
-                            shuffle=False, num_workers=4, sampler=val_sampler)
+                            shuffle=False, num_workers=4, sampler=val_sampler,
+                            worker_init_fn=val_worker_init_fn)
 
     if ddp:
         model = DDP(model, device_ids=[ddp_local_rank],
@@ -236,8 +252,8 @@ if __name__ == "__main__":
     if args.compute_magic_number:
         all_latents = list()
         with torch.no_grad():
-            for x, mask in train_loader:
-                x, mask = x.to(device), mask.to(device)
+            for x in train_loader:
+                x = x.to(device)
                 latents = model.encode(x).sample()
                 all_latents.append(latents.cpu())
         local_latents = torch.cat(all_latents)
@@ -284,12 +300,11 @@ if __name__ == "__main__":
     start_step = 0
     if args.resume == 1:
         start_step = torch.load(args.ckpt)["step"]
+        train_iter = iter(train_loader)
+        if train_sampler is not None:
+            train_sampler.set_epoch(start_step % len(trainset))
     trainset_size = len(trainset) // ddp_world_size if ddp else len(trainset)
     for step in range(start_step, args.num_iterations + 1):
-        if step % trainset_size == 0:
-            train_iter = iter(train_loader)
-            if train_sampler is not None:
-                train_sampler.set_epoch(step % len(trainset))
         t0 = time.time()
         last_step = (step == args.num_iterations - 1)
 
@@ -307,11 +322,11 @@ if __name__ == "__main__":
                 val_iter = iter(val_loader)
                 for vali in range(args.val_max_steps):
                     try:
-                        x, mask = next(val_iter)
+                        x = next(val_iter)
                     except StopIteration:
                         break
-                    x, mask = x.to(device), mask.to(device)
-                    dec, _, loss, loss_dict = model(x, mask, "val", 1, vali)
+                    x = x.to(device)
+                    dec, _, loss, loss_dict = model(x, "val", 1, vali)
                     val_loss += loss.item()
                     metrics = collect_metrics(
                         dec.permute(0, 1, 3, 4, 2).cpu().numpy(),
@@ -351,14 +366,33 @@ if __name__ == "__main__":
         model.train()
         # --------------- VAE TRAINING SECTION BEGIN -----------------
         optimizer_ae.zero_grad(set_to_none=True)
+        loss_ae_accum, loss_dict_ae_accum = 0., dict()
+        for micro_step in range(grad_accum_steps):
+            if micro_step % trainset_size == 0:
+                train_iter = iter(train_loader)
+                if train_sampler is not None:
+                    train_sampler.set_epoch(step % len(trainset))
 
-        # fetch a batch
-        x, mask = next(train_iter)
-        x, mask = x.to(device), mask.to(device)
-        dec, post, loss_ae, loss_dict_ae = model(x, mask, "train", 0, step)
-        loss_ae.backward()
+            # fetch a batch
+            x = next(train_iter)
+            x = x.to(device)
+            if ddp:
+                # we want only the last micro-step to sync grads in a DDP model
+                # the official way is with model.no_sync(), but that is a
+                # context manager that bloats code, so we just toggle this
+                model.require_backward_grad_sync = (
+                    micro_step == grad_accum_steps - 1)
+            dec, post, loss_ae, loss_dict_ae = model(x, "train", 0, step)
+            loss_ae = loss_ae / grad_accum_steps
+            for k, v in loss_dict_ae.items():
+                if k not in loss_dict_ae_accum:
+                    loss_dict_ae_accum[k] = v / grad_accum_steps
+                else:
+                    loss_dict_ae_accum[k] += v / grad_accum_steps
+            loss_ae_accum += loss_ae.detach()
+            loss_ae.backward()
         if ddp:
-            dist.all_reduce(loss_ae, op=dist.ReduceOp.AVG)
+            dist.all_reduce(loss_ae_accum, op=dist.ReduceOp.AVG)
         norm = torch.nn.utils.clip_grad_norm_(
             model.parameters(), args.grad_clip)
         # step the optimizer
@@ -366,10 +400,25 @@ if __name__ == "__main__":
 
         # --------------- DISC TRAINING SECTION BEGIN -----------------
         optimizer_disc.zero_grad(set_to_none=True)
-
-        # fetch a batch
-        dec, post, loss_disc, loss_dict_disc = model(x, mask, "train", 1, step)
-        loss_disc.backward()
+        loss_disc_accum, loss_dict_disc_accum = 0., dict()
+        for micro_step in range(grad_accum_steps):
+            if micro_step % trainset_size == 0:
+                train_iter = iter(train_loader)
+                if train_sampler is not None:
+                    train_sampler.set_epoch(step % len(trainset))
+            if ddp:
+                model.require_backward_grad_sync = (
+                    micro_step == grad_accum_steps - 1)
+            # fetch a batch
+            dec, post, loss_disc, loss_dict_disc = model(x, "train", 1, step)
+            loss_disc = loss_disc / grad_accum_steps
+            for k, v in loss_dict_disc.items():
+                if k not in loss_dict_disc_accum:
+                    loss_dict_disc_accum[k] = v / grad_accum_steps
+                else:
+                    loss_dict_disc_accum[k] += v / grad_accum_steps
+            loss_disc_accum += loss_disc.detach()
+            loss_disc.backward()
         if ddp:
             dist.all_reduce(loss_disc, op=dist.ReduceOp.AVG)
         norm = torch.nn.utils.clip_grad_norm_(
@@ -381,23 +430,23 @@ if __name__ == "__main__":
         torch.cuda.synchronize()
         t1 = time.time()
         print0(f"""step {step+1:4d}/{args.num_iterations} | \
-               train ae loss {loss_ae.item():.6f} | \
-               train disc loss {loss_disc.item():.6f} | \
+               train ae loss {loss_ae_accum.item():.6f} | \
+               train disc loss {loss_disc_accum.item():.6f} | \
                norm {norm:.4f} | \
                """)
         if args.verbose_loss:
-            x = " | ".join([f'{x}: {y.item():.4f}' for x, y in loss_dict_ae.items()])  # noqa
+            x = " | ".join([f'{x}: {y.item():.4f}' for x, y in loss_dict_ae_accum.items()])  # noqa
             print0(f"    ae verbose loss: {x}")
-            x = " | ".join([f'{x}: {y.item():.4f}' for x, y in loss_dict_disc.items()])  # noqa
+            x = " | ".join([f'{x}: {y.item():.4f}' for x, y in loss_dict_disc_accum.items()])  # noqa
             print0(f"    disc verbose loss: {x}")
         if master_process and train_logfile is not None:
             with open(train_logfile, "a") as f:
                 f.write(f"{step},")
-                f.write(f"train/loss_ae,{loss_ae.item()},")
-                f.write(f"train/loss_disc,{loss_disc.item()},")
-                f.write(",".join([f'{x},{y.item():.4f}' for x, y in loss_dict_ae.items()]))  # noqa
+                f.write(f"train/loss_ae,{loss_ae_accum},")
+                f.write(f"train/loss_disc,{loss_disc_accum},")
+                f.write(",".join([f'{x},{y.item():.4f}' for x, y in loss_dict_ae_accum.items()]))  # noqa
                 f.write(",")
-                f.write(",".join([f'{x},{y.item():.4f}' for x, y in loss_dict_disc.items()]))  # noqa
+                f.write(",".join([f'{x},{y.item():.4f}' for x, y in loss_dict_disc_accum.items()]))  # noqa
                 f.write("\n")
 
         # keep track of smooth timings, last 20 iterations

@@ -26,13 +26,16 @@ TODOs for MovieGen implementation - I'm working on this on the side of many othe
     - ~save opt state~
     - save loss state
     - log state
-- [ ] improve logging
+- [x] improve logging
     - right now it just dumps to a file, which is fine just clean the dump
 - [x] Temporal Attention is current shortcutted
     - need to implement
-- [ ] mask attention: is this required? might intro artifacts, seems to work well ish for now
-- [ ] validate batch size is working - it should be
+- [x] mask attention: is this required? might intro artifacts, seems to work well ish for now
+- [x] validate batch size is working - it should be
     - can one sample be logically chunked into multiple batches? is this even needed?
+- [ ] split of image/video batches should be improved
+    - image vs. video dataset?
+    - for validation, should consume all images and all videos
 
 # MovieGen
 - [x] build training pipeline
