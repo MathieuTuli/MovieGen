@@ -5,10 +5,13 @@ import cv2
 
 def collect_metrics(outputs, targets, metrics):
     for b in range(outputs.shape[0]):
-        if outputs[b].shape[0] > 1:
+        # REVISIT: compression ratio is defined this way
+        if outputs[b].shape[0] > 8:
             for t in range(outputs[b].shape[0]):
-                metrics["psnr_video"].append(calculate_psnr(outputs[b, t], targets[b, t]))
-                metrics["ssim_video"].append(calculate_ssim(outputs[b, t], targets[b, t]))
+                metrics["psnr_video"].append(
+                        calculate_psnr(outputs[b, t], targets[b, t]))
+                metrics["ssim_video"].append(
+                        calculate_ssim(outputs[b, t], targets[b, t]))
         else:
             metrics["psnr_image"].append(calculate_psnr(outputs[b, 0], targets[b, 0]))
             metrics["ssim_image"].append(calculate_ssim(outputs[b, 0], targets[b, 0]))
@@ -16,9 +19,6 @@ def collect_metrics(outputs, targets, metrics):
 
 
 def calculate_psnr(img1, img2, border=0):
-    # img1 and img2 have range [0, 255]
-    # img1 = img1.squeeze()
-    # img2 = img2.squeeze()
     if not img1.shape == img2.shape:
         raise ValueError('Input images must have the same dimensions.')
     h, w = img1.shape[:2]
