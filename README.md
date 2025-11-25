@@ -3,9 +3,8 @@
 Unofficial implementation of Meta's [Movie Gen Models](https://ai.meta.com/static-resource/movie-gen-research-paper/?utm_source=twitter&utm_medium=organic_social&utm_content=thread&utm_campaign=moviegen)
 
 **This code is more or less complete (minus a couple bugs and general pipeline
-cleanliness/qol), however I do not have the compute to fully train it. I am
-training a smol model now, and will probably release it after NeurIPS/Siggraph
-Asia when I have the time. If you want to contribute compute let me know!**
+cleanliness/qol), however I do not have the compute to fully train it. I also work at Meta now
+so for obvious reasons I can't contribute much else. I will try to button things up when I can.**
 
 
 **>** checkout the [todo.md](todo.md) for, a list of my todos
